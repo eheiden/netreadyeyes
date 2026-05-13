@@ -1,0 +1,27 @@
+from pathlib import Path
+
+CAMERA_NAME = "OBS Virtual Camera"
+
+TOP_K = 5
+CONFIDENCE_THRESHOLD = 0.4
+
+REQUEST_WIDTH = 1920
+REQUEST_HEIGHT = 1080
+REQUEST_FPS = 30
+
+ROI_SETTINGS_FILE = Path("roi_settings.json")
+
+WINDOW_NAME = "CollectorVision Scanner"
+
+HANDLE_SIZE = 12
+MIN_ROI_SIZE = 40
+
+AUTO_SCAN_ENABLED = True
+AUTO_SCAN_INTERVAL_SECONDS = 1.0
+
+AUTO_SEND_TO_OBS = False
+
+DEBUG_SAVE_CROPS = False
+
+DEBUG_CROPS_DIR = Path("debug_crops")
+DEBUG_CROPS_DIR.mkdir(exist_ok=True)
