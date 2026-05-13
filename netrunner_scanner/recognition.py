@@ -11,10 +11,7 @@ from .crop import crop_candidate
 from .detection import find_card_candidates
 from .obs_bridge import send_match_to_obs
 
-latest_matches = {
-    "left": [],
-    "right": [],
-}
+latest_matches = {"left": [], "right": []}
 
 def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
     crop = crop_candidate(frame, candidate)
@@ -56,13 +53,7 @@ def scan_side_for_matches(frame, roi, side, catalog):
     matches = []
 
     for i, candidate in enumerate(candidates, start=1):
-        best = recognize_candidate_crop(
-            frame=frame,
-            candidate=candidate,
-            side=side,
-            candidate_index=i,
-            catalog=catalog,
-        )
+        best = recognize_candidate_crop(frame, candidate, side, i, catalog)
 
         if best is None:
             label = "unknown"
@@ -73,19 +64,18 @@ def scan_side_for_matches(frame, roi, side, catalog):
             score = best["score"]
             rotation = best["rotation"]
 
-        matches.append({
-            "box": candidate["box"],
-            "label": label,
-            "score": score,
-            "rotation": rotation,
-        })
+        matches.append(
+            {
+                "box": candidate["box"],
+                "label": label,
+                "score": score,
+                "rotation": rotation,
+            }
+        )
 
     latest_matches[side] = matches
 
-    confident_matches = [
-        m for m in matches
-        if m["score"] >= CONFIDENCE_THRESHOLD
-    ]
+    confident_matches = [m for m in matches if m["score"] >= CONFIDENCE_THRESHOLD]
 
     if AUTO_SEND_TO_OBS and confident_matches:
         best_match = max(confident_matches, key=lambda m: m["score"])

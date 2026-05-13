@@ -7,17 +7,12 @@ def find_card_candidates(frame, roi):
 
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
     edges = cv2.Canny(blur, 50, 150)
 
     kernel = np.ones((3, 3), np.uint8)
     edges = cv2.dilate(edges, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(
-        edges,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
     roi_area = w * h
@@ -27,7 +22,6 @@ def find_card_candidates(frame, roi):
 
         if area < roi_area * 0.003:
             continue
-
         if area > roi_area * 0.20:
             continue
 
@@ -54,19 +48,14 @@ def find_card_candidates(frame, roi):
         box_x, box_y, box_w, box_h = cv2.boundingRect(box)
 
         if (
-            box_x <= x + margin or
-            box_y <= y + margin or
-            box_x + box_w >= x + w - margin or
-            box_y + box_h >= y + h - margin
+            box_x <= x + margin
+            or box_y <= y + margin
+            or box_x + box_w >= x + w - margin
+            or box_y + box_h >= y + h - margin
         ):
             continue
 
-        candidates.append({
-            "box": box,
-            "area": area,
-            "aspect": aspect,
-        })
+        candidates.append({"box": box, "area": area, "aspect": aspect})
 
     candidates.sort(key=lambda c: c["area"], reverse=True)
-
     return candidates

@@ -1,17 +1,9 @@
 import json
-
 import cv2
 
-from .config import (
-    ROI_SETTINGS_FILE,
-    HANDLE_SIZE,
-    MIN_ROI_SIZE,
-)
+from .config import ROI_SETTINGS_FILE, HANDLE_SIZE, MIN_ROI_SIZE
 
-rois = {
-    "left": None,
-    "right": None,
-}
+rois = {"left": None, "right": None}
 
 drag_state = {
     "active": False,
@@ -23,7 +15,6 @@ drag_state = {
 
 def default_rois(frame_width, frame_height):
     split_x = frame_width // 2
-
     return {
         "left": [0, 0, split_x, frame_height],
         "right": [split_x, 0, frame_width - split_x, frame_height],
@@ -40,7 +31,6 @@ def clamp_roi(roi, frame_width, frame_height):
 
     if x + w > frame_width:
         w = frame_width - x
-
     if y + h > frame_height:
         h = frame_height - y
 
@@ -53,15 +43,12 @@ def load_rois(frame_width, frame_height):
 
     try:
         data = json.loads(ROI_SETTINGS_FILE.read_text())
-
         loaded = {
             "left": clamp_roi(data["left"], frame_width, frame_height),
             "right": clamp_roi(data["right"], frame_width, frame_height),
         }
-
         print(f"Loaded ROI settings from {ROI_SETTINGS_FILE}")
         return loaded
-
     except Exception as e:
         print("Could not load ROI settings; using defaults.")
         print(e)
@@ -99,7 +86,6 @@ def get_resize_mode(px, py, roi):
         return "resize_t"
     if bottom:
         return "resize_b"
-
     return None
 
 def update_roi_from_drag(side, mode, start_roi, dx, dy, frame_width, frame_height):
@@ -108,37 +94,29 @@ def update_roi_from_drag(side, mode, start_roi, dx, dy, frame_width, frame_heigh
     if mode == "move":
         x += dx
         y += dy
-
     elif mode == "resize_l":
         x += dx
         w -= dx
-
     elif mode == "resize_r":
         w += dx
-
     elif mode == "resize_t":
         y += dy
         h -= dy
-
     elif mode == "resize_b":
         h += dy
-
     elif mode == "resize_tl":
         x += dx
         y += dy
         w -= dx
         h -= dy
-
     elif mode == "resize_tr":
         y += dy
         w += dx
         h -= dy
-
     elif mode == "resize_bl":
         x += dx
         w -= dx
         h += dy
-
     elif mode == "resize_br":
         w += dx
         h += dy
@@ -151,7 +129,6 @@ def on_mouse(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         for side in ["right", "left"]:
             roi = rois[side]
-
             resize_mode = get_resize_mode(x, y, roi)
 
             if resize_mode:
@@ -175,7 +152,6 @@ def on_mouse(event, x, y, flags, param):
             sx, sy = drag_state["start_mouse"]
             dx = x - sx
             dy = y - sy
-
             update_roi_from_drag(
                 drag_state["side"],
                 drag_state["mode"],

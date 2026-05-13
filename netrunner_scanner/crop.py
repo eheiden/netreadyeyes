@@ -29,19 +29,15 @@ def crop_candidate(frame, candidate):
     if max_width <= 0 or max_height <= 0:
         return None
 
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1],
-    ], dtype="float32")
-
-    matrix = cv2.getPerspectiveTransform(ordered, dst)
-
-    warped = cv2.warpPerspective(
-        frame,
-        matrix,
-        (max_width, max_height),
+    dst = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype="float32",
     )
 
-    return warped
+    matrix = cv2.getPerspectiveTransform(ordered, dst)
+    return cv2.warpPerspective(frame, matrix, (max_width, max_height))

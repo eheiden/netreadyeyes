@@ -1,5 +1,4 @@
 import cv2
-
 from .config import HANDLE_SIZE
 
 def draw_roi(frame, side, roi):
@@ -14,12 +13,7 @@ def draw_roi(frame, side, roi):
 
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-    for hx, hy in [
-        (x, y),
-        (x + w, y),
-        (x, y + h),
-        (x + w, y + h),
-    ]:
+    for hx, hy in [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]:
         cv2.rectangle(
             frame,
             (hx - HANDLE_SIZE // 2, hy - HANDLE_SIZE // 2),

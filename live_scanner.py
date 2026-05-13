@@ -6,7 +6,6 @@ from netrunner_scanner.config import (
     AUTO_SCAN_ENABLED,
     AUTO_SCAN_INTERVAL_SECONDS,
 )
-
 from netrunner_scanner.camera import open_camera
 from netrunner_scanner.catalog import CardCatalog
 from netrunner_scanner.roi import (
@@ -20,10 +19,8 @@ from netrunner_scanner.recognition import (
     latest_matches,
     scan_side_for_matches,
 )
-from netrunner_scanner.drawing import (
-    draw_roi,
-    draw_card_matches,
-)
+from netrunner_scanner.drawing import draw_roi, draw_card_matches
+
 
 def main():
     cap = open_camera()
@@ -57,7 +54,6 @@ def main():
             print("\nFrame shape:", frame.shape)
 
             loaded = load_rois(frame_width, frame_height)
-
             rois["left"] = loaded["left"]
             rois["right"] = loaded["right"]
 
@@ -112,6 +108,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
