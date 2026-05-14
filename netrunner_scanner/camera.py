@@ -3,6 +3,7 @@ from pygrabber.dshow_graph import FilterGraph
 
 from .config import CAMERA_NAME, REQUEST_WIDTH, REQUEST_HEIGHT, REQUEST_FPS
 
+
 def open_camera():
     graph = FilterGraph()
     devices = graph.get_input_devices()

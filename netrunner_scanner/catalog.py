@@ -3,6 +3,7 @@ import collector_vision as cvg
 
 from .config import TOP_K
 
+
 class CardCatalog:
     def __init__(self, catalog_path):
         print("\nLoading embedder...")

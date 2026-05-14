@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
 
@@ -13,6 +14,7 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
 
     return rect
+
 
 def crop_candidate(frame, candidate):
     box = candidate["box"].astype("float32")

@@ -18,8 +18,110 @@ MIN_ROI_SIZE = 40
 AUTO_SCAN_ENABLED = True
 AUTO_SCAN_INTERVAL_SECONDS = 1.0
 
+# Direct send is disabled because OBS_QUEUE_ENABLED handles output timing.
 AUTO_SEND_TO_OBS = False
 
 DEBUG_SAVE_CROPS = False
 DEBUG_CROPS_DIR = Path("debug_crops")
 DEBUG_CROPS_DIR.mkdir(exist_ok=True)
+
+# Tracking
+
+TRACK_IOU_THRESHOLD = 0.35
+STATIONARY_CENTER_THRESHOLD_PX = 18
+STATIONARY_REFRESH_SECONDS = 20.0
+TRACK_EXPIRE_SECONDS = 6.0
+
+# OBS output queue
+
+OBS_QUEUE_ENABLED = True
+OBS_QUEUE_POP_INTERVAL_SECONDS = 8.0
+OBS_QUEUE_DEDUP_VISIBLE = True
+
+# Corner refinement
+
+# First pass finds rough card regions; the corner model tightens the crop before matching.
+USE_COLLECTORVISION_CORNER_REFINER = True
+
+# Add a small buffer around rough boxes before corner refinement.
+CORNER_REFINER_PADDING_RATIO = 0.10
+
+# Reject corner-refine results that look too weak or blurry.
+CORNER_REFINER_MIN_SHARPNESS = 0.0355
+
+# Draw the refined corner box when available.
+DRAW_REFINED_BOX = True
+
+# Prefer CUDA where the installed runtime supports it.
+PREFER_CUDA_FOR_CORNER_DETECTOR = True
+
+CORNER_REFINER_MIN_IOU_WITH_PROPOSAL = 0.25
+CORNER_REFINER_MIN_AREA_RATIO = 0.45
+CORNER_REFINER_MAX_AREA_RATIO = 2.20
+CORNER_REFINER_MIN_EDGE_LENGTH = 25
+CORNER_REFINER_MIN_ASPECT = 1.20
+CORNER_REFINER_MAX_ASPECT = 1.70
+CORNER_REFINER_FALLBACK_TO_OPENCV = True
+
+# Match quality
+
+AMBIGUOUS_MATCH_SCORE_THRESHOLD = 0.55
+AMBIGUOUS_MATCH_MIN_MARGIN = 0.08
+
+CARD_BACK_EDGE_RATIO_THRESHOLD = 0.030
+CARD_BACK_SAT_STD_THRESHOLD = 45.0
+
+REFINED_BOX_SMOOTHING_ALPHA = 0.75
+
+CARD_BACK_VAL_STD_THRESHOLD = 60.0
+
+# Overlapping-card proposals
+
+USE_INTERNAL_CONTOUR_PROPOSALS = True
+PROPOSAL_NMS_IOU_THRESHOLD = 0.55
+MIN_RECTANGULAR_FILL_RATIO = 0.48
+MAX_RECTANGULAR_FILL_RATIO = 1.25
+
+# Proposal quality filters
+
+REJECT_NESTED_CANDIDATES = True
+NESTED_CONTAINMENT_THRESHOLD = 0.85
+NESTED_AREA_RATIO_THRESHOLD = 0.25
+
+MIN_CARD_SHORT_SIDE_PX = 65
+
+RECTANGLE_BORDER_CHECK_ENABLED = True
+MIN_BORDER_BAND_EDGE_RATIO = 0.018
+MIN_BORDER_BANDS_PRESENT = 2
+
+MAX_CANDIDATES_PER_SIDE = 12
+
+# Reject large merged blobs when they contain better card-sized child boxes.
+COMPOSITE_PARENT_REJECTION_ENABLED = True
+COMPOSITE_CHILD_MIN_AREA_RATIO = 0.25
+COMPOSITE_CHILD_MAX_AREA_RATIO = 0.85
+COMPOSITE_CHILD_CONTAINMENT_THRESHOLD = 0.55
+COMPOSITE_PARENT_MIN_CHILDREN = 1
+
+# Detect facedown cards from low center texture instead of sleeve color.
+CARD_BACK_CENTER_EDGE_RATIO_THRESHOLD = 0.020
+CARD_BACK_CENTER_SAT_STD_THRESHOLD = 55.0
+CARD_BACK_CENTER_VAL_STD_THRESHOLD = 55.0
+
+# Solid facedown cards can be missed by edge-based proposals because they have
+# very little internal texture. This secondary pass looks for smooth colored
+# rectangles that contrast with the mat.
+SOLID_BACK_PROPOSALS_ENABLED = True
+SOLID_BACK_MIN_AREA_RATIO = 0.004
+SOLID_BACK_MAX_AREA_RATIO = 0.08
+SOLID_BACK_MIN_SHORT_SIDE_PX = 70
+SOLID_BACK_MAX_TEXTURE_EDGE_RATIO = 0.020
+SOLID_BACK_MIN_COLOR_DISTANCE = 22.0
+
+# Skip expensive recognition scans when the playmat has not changed. The UI
+# still updates every frame; this only gates the recognition pass.
+MOTION_GATING_ENABLED = True
+MOTION_DOWNSAMPLE_WIDTH = 320
+MOTION_SCAN_THRESHOLD = 0.006
+MOTION_FORCE_SCAN_SECONDS = 8.0
+

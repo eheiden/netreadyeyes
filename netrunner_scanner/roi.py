@@ -13,12 +13,14 @@ drag_state = {
     "start_roi": None,
 }
 
+
 def default_rois(frame_width, frame_height):
     split_x = frame_width // 2
     return {
         "left": [0, 0, split_x, frame_height],
         "right": [split_x, 0, frame_width - split_x, frame_height],
     }
+
 
 def clamp_roi(roi, frame_width, frame_height):
     x, y, w, h = roi
@@ -35,6 +37,7 @@ def clamp_roi(roi, frame_width, frame_height):
         h = frame_height - y
 
     return [int(x), int(y), int(w), int(h)]
+
 
 def load_rois(frame_width, frame_height):
     if not ROI_SETTINGS_FILE.exists():
@@ -54,13 +57,16 @@ def load_rois(frame_width, frame_height):
         print(e)
         return default_rois(frame_width, frame_height)
 
+
 def save_rois():
     ROI_SETTINGS_FILE.write_text(json.dumps(rois, indent=2))
     print(f"\nSaved ROI settings to {ROI_SETTINGS_FILE}")
 
+
 def point_in_roi(px, py, roi):
     x, y, w, h = roi
     return x <= px <= x + w and y <= py <= y + h
+
 
 def get_resize_mode(px, py, roi):
     x, y, w, h = roi
@@ -87,6 +93,7 @@ def get_resize_mode(px, py, roi):
     if bottom:
         return "resize_b"
     return None
+
 
 def update_roi_from_drag(side, mode, start_roi, dx, dy, frame_width, frame_height):
     x, y, w, h = start_roi
@@ -122,6 +129,7 @@ def update_roi_from_drag(side, mode, start_roi, dx, dy, frame_width, frame_heigh
         h += dy
 
     rois[side] = clamp_roi([x, y, w, h], frame_width, frame_height)
+
 
 def on_mouse(event, x, y, flags, param):
     frame_width, frame_height = param

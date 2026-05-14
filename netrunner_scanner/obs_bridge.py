@@ -2,6 +2,7 @@ import requests
 
 last_sent_to_obs = {"left": None, "right": None}
 
+
 def send_match_to_obs(side, card_id):
     if last_sent_to_obs[side] == card_id:
         return

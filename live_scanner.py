@@ -1,3 +1,4 @@
+
 import time
 import cv2
 
@@ -5,6 +6,7 @@ from netrunner_scanner.config import (
     WINDOW_NAME,
     AUTO_SCAN_ENABLED,
     AUTO_SCAN_INTERVAL_SECONDS,
+    MOTION_GATING_ENABLED,
 )
 from netrunner_scanner.camera import open_camera
 from netrunner_scanner.catalog import CardCatalog
@@ -18,8 +20,10 @@ from netrunner_scanner.roi import (
 from netrunner_scanner.recognition import (
     latest_matches,
     scan_side_for_matches,
+    tick_obs_queue,
 )
 from netrunner_scanner.drawing import draw_roi, draw_card_matches
+from netrunner_scanner.motion import MotionGate
 
 
 def main():
@@ -30,8 +34,9 @@ def main():
 
     initialized = False
     last_auto_scan_time = 0
+    motion_gate = MotionGate()
 
-    print("\nControls:")
+    print("\\nControls:")
     print("Mouse drag inside box = move ROI")
     print("Mouse drag edge/corner = resize ROI")
     print("Q = manually scan LEFT / pink playmat")
@@ -39,7 +44,7 @@ def main():
     print("S = save ROI settings")
     print("L = load ROI settings")
     print("R = reset ROIs to left/right split")
-    print("ESC = quit\n")
+    print("ESC = quit\\n")
 
     while True:
         ret, frame = cap.read()
@@ -51,7 +56,7 @@ def main():
         frame_height, frame_width = frame.shape[:2]
 
         if not initialized:
-            print("\nFrame shape:", frame.shape)
+            print("\\nFrame shape:", frame.shape)
 
             loaded = load_rois(frame_width, frame_height)
             rois["left"] = loaded["left"]
@@ -68,9 +73,22 @@ def main():
         now = time.time()
 
         if AUTO_SCAN_ENABLED and now - last_auto_scan_time >= AUTO_SCAN_INTERVAL_SECONDS:
-            scan_side_for_matches(frame, rois["left"], "left", catalog)
-            scan_side_for_matches(frame, rois["right"], "right", catalog)
+            if MOTION_GATING_ENABLED:
+                left_should_scan, _left_reason = motion_gate.should_scan(frame, rois["left"], "left")
+                right_should_scan, _right_reason = motion_gate.should_scan(frame, rois["right"], "right")
+            else:
+                left_should_scan = True
+                right_should_scan = True
+
+            if left_should_scan:
+                scan_side_for_matches(frame, rois["left"], "left", catalog)
+
+            if right_should_scan:
+                scan_side_for_matches(frame, rois["right"], "right", catalog)
+
             last_auto_scan_time = now
+
+        tick_obs_queue()
 
         display_frame = frame.copy()
 
@@ -87,7 +105,7 @@ def main():
         if key == 27:
             break
 
-        elif key == ord("q"):
+        if key == ord("q"):
             scan_side_for_matches(frame, rois["left"], "left", catalog)
 
         elif key == ord("e"):
@@ -100,11 +118,11 @@ def main():
             loaded = load_rois(frame_width, frame_height)
             rois["left"] = loaded["left"]
             rois["right"] = loaded["right"]
-            print("\nLoaded ROI settings.")
+            print("\\nLoaded ROI settings.")
 
         elif key == ord("r"):
             rois.update(default_rois(frame_width, frame_height))
-            print("\nReset ROIs to default left/right split.")
+            print("\\nReset ROIs to default left/right split.")
 
     cap.release()
     cv2.destroyAllWindows()
