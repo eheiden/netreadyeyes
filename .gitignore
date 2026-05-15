@@ -12,6 +12,7 @@ venv/
 
 # Local runtime/config files
 roi_settings.json
+netreadyeyes_settings.json
 
 # Generated/debug output
 debug_crops/
