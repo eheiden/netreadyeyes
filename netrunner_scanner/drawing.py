@@ -1,10 +1,11 @@
+
 import cv2
 from .config import HANDLE_SIZE
 
 ROI_LEFT_COLOR = (0, 255, 0)
 ROI_RIGHT_COLOR = (255, 0, 0)
 
-PROPOSAL_COLOR = (180, 180, 180)
+PROPOSAL_COLOR = (110, 110, 110)
 REFINED_COLOR = (255, 255, 0)
 
 DISPLAYED_COLOR = (0, 255, 255)
@@ -45,13 +46,27 @@ def draw_roi(frame, side, roi):
     )
 
 
+def is_known_card_label(label):
+    return label not in (None, "", "unknown", "tracking", "card_back")
+
+
 def state_color(match):
-    if match.get("label") == "card_back":
+    label = match.get("label")
+
+    if label == "card_back":
         return CARD_BACK_COLOR
-    if match.get("displayed"):
-        return DISPLAYED_COLOR
+
     if match.get("queued"):
         return QUEUED_COLOR
+
+    if match.get("displayed"):
+        return DISPLAYED_COLOR
+
+    # If a known card is stable and not in the FIFO, treat it as already handled
+    # visually. This avoids the "pink forever" state for cached/reacquired cards.
+    if is_known_card_label(label) and match.get("stationary"):
+        return DISPLAYED_COLOR
+
     return UNDISPLAYED_COLOR
 
 
@@ -62,7 +77,17 @@ def draw_card_matches(frame, matches):
         active_box = match.get("box")
         used_fallback = match.get("used_fallback", False)
 
-        if proposal_box is not None:
+        # Draw the rough proposal only if it is meaningfully different from the
+        # active box. This keeps stale-looking gray boxes from cluttering the UI.
+        if proposal_box is not None and active_box is not None:
+            px, py, pw, ph = cv2.boundingRect(proposal_box)
+            ax, ay, aw, ah = cv2.boundingRect(active_box)
+            center_delta = abs((px + pw / 2) - (ax + aw / 2)) + abs((py + ph / 2) - (ay + ah / 2))
+            size_delta = abs(pw - aw) + abs(ph - ah)
+
+            if center_delta > 18 or size_delta > 24:
+                cv2.drawContours(frame, [proposal_box], 0, PROPOSAL_COLOR, 1)
+        elif proposal_box is not None:
             cv2.drawContours(frame, [proposal_box], 0, PROPOSAL_COLOR, 1)
 
         if refined_box is not None and not used_fallback:
@@ -98,7 +123,8 @@ def draw_card_matches(frame, matches):
             text += f" s:{sharpness:.3f}"
 
         if label == "card_back" and detail is not None:
-            text += f" edge:{detail['edge_ratio']:.3f}"
+            edge_value = detail.get("edge_ratio", detail.get("center_edge_ratio", 0.0))
+            text += f" edge:{edge_value:.3f}"
 
         text += suffix
 

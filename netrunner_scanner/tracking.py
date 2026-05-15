@@ -3,6 +3,15 @@ import time
 import cv2
 import numpy as np
 
+from .config import (
+    TRACK_CENTER_MATCH_THRESHOLD_PX,
+    TRACK_VISIBLE_MISSING_SECONDS,
+    TRACK_REACQUIRE_CENTER_THRESHOLD_PX,
+    TRACK_REQUEUE_CENTER_THRESHOLD_PX,
+    TRACK_REUSE_AFTER_MISSING_SECONDS,
+)
+from .stability import log_event, log_human_event
+
 
 def box_to_rect(box):
     return cv2.boundingRect(box)
@@ -69,6 +78,9 @@ class CardTracker:
         self.next_track_id = 1
         self.tracks = {"left": [], "right": []}
 
+    def current_time(self):
+        return time.time()
+
     def expire_old_tracks(self, side, now=None):
         if now is None:
             now = time.time()
@@ -81,36 +93,50 @@ class CardTracker:
     def match_track(self, side, box):
         rect = box_to_rect(box)
         best_track = None
-        best_iou = 0.0
+        best_score = -1.0
 
         for track in self.tracks[side]:
-            score = rect_iou(rect, track["rect"])
+            old_rect = track["rect"]
+            iou_score = rect_iou(rect, old_rect)
+            distance = center_distance(rect, old_rect)
+            has_known_label = track.get("label") not in (None, "", "unknown")
 
-            if score > best_iou:
-                best_iou = score
+            if iou_score >= self.iou_threshold:
+                score = 1000.0 + iou_score
+            elif has_known_label and distance <= TRACK_REACQUIRE_CENTER_THRESHOLD_PX:
+                score = 700.0 - distance
+            elif distance <= TRACK_CENTER_MATCH_THRESHOLD_PX:
+                score = 500.0 - distance
+            else:
+                continue
+
+            if score > best_score:
+                best_score = score
                 best_track = track
 
-        if best_track is not None and best_iou >= self.iou_threshold:
-            return best_track
+        return best_track
 
-        return None
-
-    def should_reprocess(self, track, new_rect, now=None):
+    def should_reprocess(self, track, new_rect, missing_seconds=0.0, now=None):
         if now is None:
             now = time.time()
 
-        if not track.get("label") or track.get("label") == "unknown":
+        label = track.get("label")
+
+        if not label or label == "unknown":
             return True
 
         moved_px = center_distance(track["rect"], new_rect)
 
-        if moved_px > self.stationary_center_threshold_px:
+        # Only treat this as a possible replacement if it was genuinely missing
+        # longer than the normal scan cadence. A too-short value here caused the
+        # old recognized -> unknown -> recognized flicker.
+        if missing_seconds > TRACK_REUSE_AFTER_MISSING_SECONDS:
             return True
 
-        if track.get("label") == "card_back":
+        if moved_px <= TRACK_REACQUIRE_CENTER_THRESHOLD_PX:
             return False
 
-        if now - track.get("last_processed_at", 0.0) >= self.stationary_refresh_seconds:
+        if moved_px >= TRACK_REQUEUE_CENTER_THRESHOLD_PX:
             return True
 
         return False
@@ -144,28 +170,92 @@ class CardTracker:
                 "used_fallback": False,
                 "refine_reason": None,
                 "detail_metrics": None,
+                "visual_signature": None,
+                "missing_seconds": 0.0,
+                "unknown_streak": 0,
+                "force_new_identification": False,
+                "needs_same_spot_signature_check": False,
+                "last_decision": "new_track",
             }
             self.next_track_id += 1
             self.tracks[side].append(track)
+            log_event(side, track["track_id"], "new_track")
             return track, True
 
-        moved_px = center_distance(track["rect"], rect)
-        needs_processing = self.should_reprocess(track, rect, now)
+        previous_rect = track["rect"]
+        missing_seconds = now - track["last_seen_at"]
+        moved_px = center_distance(previous_rect, rect)
+        needs_processing = self.should_reprocess(
+            track,
+            rect,
+            missing_seconds=missing_seconds,
+            now=now,
+        )
 
         track["box"] = box
         track["rect"] = rect
         track["last_seen_at"] = now
+        track["missing_seconds"] = missing_seconds
         track["stationary"] = moved_px <= self.stationary_center_threshold_px
+        track["proposal_box"] = box
 
-        if moved_px > self.stationary_center_threshold_px:
+        moved_replacement_like = moved_px >= TRACK_REQUEUE_CENTER_THRESHOLD_PX
+        stale_same_spot_check = (
+            missing_seconds > TRACK_REUSE_AFTER_MISSING_SECONDS
+            and moved_px < TRACK_REQUEUE_CENTER_THRESHOLD_PX
+        )
+
+        if moved_replacement_like:
             track["displayed"] = False
             track["queued"] = False
             track["refined_box"] = None
+            track["force_new_identification"] = True
+            track["needs_same_spot_signature_check"] = False
+            track["last_decision"] = f"moved_replacement_check missing={missing_seconds:.2f} moved={moved_px:.1f}"
+            log_event(
+                side,
+                track["track_id"],
+                "replacement_check",
+                label=track.get("label"),
+                missing=f"{missing_seconds:.2f}",
+                moved=f"{moved_px:.1f}",
+                kind="moved",
+            )
+            log_human_event(
+                side,
+                track["track_id"],
+                "replacement_check",
+                label=track.get("label"),
+                missing=f"{missing_seconds:.2f}",
+                moved=f"{moved_px:.1f}",
+            )
+        elif stale_same_spot_check:
+            # A side may simply not have been scanned for a while. Do not drop
+            # the old ID yet. Recognition will compare a lightweight visual
+            # signature and only refresh the ID if the crop is genuinely different.
+            track["force_new_identification"] = False
+            track["needs_same_spot_signature_check"] = True
+            track["last_decision"] = f"same_spot_verify missing={missing_seconds:.2f} moved={moved_px:.1f}"
+            log_event(
+                side,
+                track["track_id"],
+                "same_spot_verify",
+                label=track.get("label"),
+                missing=f"{missing_seconds:.2f}",
+                moved=f"{moved_px:.1f}",
+            )
+        elif not needs_processing and track.get("label") not in (None, "", "unknown", "tracking", "card_back"):
+            if not track.get("queued", False):
+                track["displayed"] = True
+            track["last_decision"] = f"reuse_known missing={missing_seconds:.2f} moved={moved_px:.1f}"
+        else:
+            track["last_decision"] = f"needs_processing missing={missing_seconds:.2f} moved={moved_px:.1f}"
 
         return track, needs_processing
 
     def apply_recognition_result(self, track, best):
         now = time.time()
+        old_label = track.get("label")
 
         if best is None:
             track["label"] = "unknown"
@@ -174,6 +264,7 @@ class CardTracker:
             track["rotation"] = "?"
             track["used_fallback"] = True
             track["refine_reason"] = "no_match"
+            track["last_decision"] = "applied_unknown_no_match"
         else:
             track["label"] = best["id"]
             track["score"] = float(best["score"])
@@ -193,6 +284,10 @@ class CardTracker:
             track["used_fallback"] = best.get("used_fallback", False)
             track["refine_reason"] = best.get("refine_reason")
             track["detail_metrics"] = best.get("detail_metrics")
+            track["last_decision"] = f"applied_{best.get('id')} score={float(best.get('score', 0.0)):.2f}"
+
+            if best.get("visual_signature") is not None:
+                track["visual_signature"] = best.get("visual_signature")
 
             new_refined = best.get("refined_box")
             if new_refined is not None:
@@ -204,15 +299,37 @@ class CardTracker:
             elif track["used_fallback"]:
                 track["refined_box"] = None
 
+        if old_label != track.get("label"):
+            log_event(
+                track.get("side"),
+                track.get("track_id"),
+                "label_change",
+                old=old_label,
+                new=track.get("label"),
+                reason=track.get("refine_reason"),
+                score=f"{track.get('score', 0.0):.2f}",
+            )
+            log_human_event(
+                track.get("side"),
+                track.get("track_id"),
+                "label_change",
+                old=old_label,
+                new=track.get("label"),
+                reason=track.get("refine_reason"),
+                score=f"{track.get('score', 0.0):.2f}",
+            )
+
         track["last_processed_at"] = now
 
     def get_visible_matches(self, side):
         now = time.time()
         self.expire_old_tracks(side, now)
-
         matches = []
 
         for track in self.tracks[side]:
+            if now - track["last_seen_at"] > TRACK_VISIBLE_MISSING_SECONDS:
+                continue
+
             active_box = track.get("refined_box") if (
                 track.get("refined_box") is not None and not track.get("used_fallback")
             ) else track["box"]
@@ -238,6 +355,11 @@ class CardTracker:
                 "used_fallback": track.get("used_fallback", False),
                 "refine_reason": track.get("refine_reason"),
                 "detail_metrics": track.get("detail_metrics"),
+                "missing_seconds": track.get("missing_seconds", 0.0),
+                "unknown_streak": track.get("unknown_streak", 0),
+                "force_new_identification": track.get("force_new_identification", False),
+                "last_decision": track.get("last_decision", ""),
+                "needs_same_spot_signature_check": track.get("needs_same_spot_signature_check", False),
             })
 
         return matches

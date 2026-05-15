@@ -26,6 +26,13 @@ from .config import (
     SOLID_BACK_MIN_SHORT_SIDE_PX,
     SOLID_BACK_MAX_TEXTURE_EDGE_RATIO,
     SOLID_BACK_MIN_COLOR_DISTANCE,
+    EDGE_PROPOSAL_MIN_AREA_RATIO,
+    WHOLE_CARD_SIZE_FILTER_ENABLED,
+    WHOLE_CARD_MIN_AREA_FRACTION_OF_REFERENCE,
+    WHOLE_CARD_REFERENCE_TOP_N,
+    INNER_BOX_OVERLAP_REJECTION_ENABLED,
+    INNER_BOX_OVERLAP_THRESHOLD,
+    INNER_BOX_MAX_AREA_RATIO,
 )
 
 
@@ -150,6 +157,100 @@ def suppress_nested_and_composite_candidates(candidates):
     ]
 
 
+def suppress_inner_overlap_boxes(candidates):
+    if not INNER_BOX_OVERLAP_REJECTION_ENABLED:
+        return candidates
+
+    rejected = set()
+    rects = [candidate_area_rect(candidate) for candidate in candidates]
+
+    for i, candidate_i in enumerate(candidates):
+        if candidate_i.get("source") == "solid_back":
+            continue
+
+        xi, yi, wi, hi, area_i = rects[i]
+
+        if area_i <= 0:
+            rejected.add(i)
+            continue
+
+        for j, candidate_j in enumerate(candidates):
+            if i == j:
+                continue
+
+            xj, yj, wj, hj, area_j = rects[j]
+
+            if area_j <= area_i:
+                continue
+
+            area_ratio = area_i / area_j
+
+            if area_ratio > INNER_BOX_MAX_AREA_RATIO:
+                continue
+
+            inter = rect_intersection_area(
+                (xi, yi, wi, hi),
+                (xj, yj, wj, hj),
+            )
+
+            overlap_fraction = inter / area_i
+
+            if overlap_fraction >= INNER_BOX_OVERLAP_THRESHOLD:
+                rejected.add(i)
+                break
+
+    return [
+        candidate
+        for idx, candidate in enumerate(candidates)
+        if idx not in rejected
+    ]
+
+
+def filter_by_whole_card_size(candidates):
+    if not WHOLE_CARD_SIZE_FILTER_ENABLED:
+        return candidates
+
+    edge_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("source") == "edge"
+    ]
+
+    if len(edge_candidates) < 2:
+        return candidates
+
+    edge_areas = sorted(
+        [cv2.contourArea(candidate["box"].astype(np.float32)) for candidate in edge_candidates],
+        reverse=True,
+    )
+
+    reference_pool = edge_areas[:WHOLE_CARD_REFERENCE_TOP_N]
+
+    if not reference_pool:
+        return candidates
+
+    reference_area = float(np.median(reference_pool))
+
+    if reference_area <= 0:
+        return candidates
+
+    min_area = reference_area * WHOLE_CARD_MIN_AREA_FRACTION_OF_REFERENCE
+
+    filtered = []
+
+    for candidate in candidates:
+        if candidate.get("source") != "edge":
+            filtered.append(candidate)
+            continue
+
+        area = cv2.contourArea(candidate["box"].astype(np.float32))
+
+        if area >= min_area:
+            filtered.append(candidate)
+
+    return filtered
+
+
 def non_max_suppression(candidates):
     kept = []
 
@@ -224,7 +325,7 @@ def contour_to_candidate(contour, gray_roi, roi_offset, roi_area, roi_bounds):
 
     area = cv2.contourArea(contour)
 
-    if area < roi_area * 0.002:
+    if area < roi_area * EDGE_PROPOSAL_MIN_AREA_RATIO:
         return None
 
     if area > roi_area * 0.24:
@@ -339,7 +440,6 @@ def local_texture_edge_ratio(gray_roi, local_box):
     warped = cv2.warpPerspective(gray_roi, matrix, (max_width, max_height))
     warped = cv2.resize(warped, (120, 168), interpolation=cv2.INTER_AREA)
 
-    # Ignore the border; measure texture inside the card.
     inner = warped[20:-20, 20:-20]
 
     if inner.size == 0:
@@ -360,7 +460,6 @@ def solid_back_candidates(frame, roi, gray_roi):
     lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
     blurred = cv2.GaussianBlur(lab, (41, 41), 0)
 
-    # Color distance from the local background estimate.
     diff = lab.astype(np.int16) - blurred.astype(np.int16)
     dist = np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
 
@@ -468,6 +567,8 @@ def find_card_candidates(frame, roi):
     candidates.extend(solid_back_candidates(frame, roi, gray))
 
     candidates = suppress_nested_and_composite_candidates(candidates)
+    candidates = suppress_inner_overlap_boxes(candidates)
+    candidates = filter_by_whole_card_size(candidates)
     candidates = non_max_suppression(candidates)
 
     candidates.sort(key=lambda c: c.get("area", 0.0), reverse=True)

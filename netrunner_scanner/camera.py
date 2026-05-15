@@ -1,10 +1,15 @@
 import cv2
 from pygrabber.dshow_graph import FilterGraph
 
-from .config import CAMERA_NAME, REQUEST_WIDTH, REQUEST_HEIGHT, REQUEST_FPS
+from .config import CAMERA_NAME, REQUEST_WIDTH, REQUEST_HEIGHT, REQUEST_FPS, OPENCV_NUM_THREADS
 
 
 def open_camera():
+    try:
+        cv2.setNumThreads(OPENCV_NUM_THREADS)
+    except cv2.error:
+        pass
+
     graph = FilterGraph()
     devices = graph.get_input_devices()
 
