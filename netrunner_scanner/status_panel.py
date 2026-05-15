@@ -7,6 +7,10 @@ from .config import (
     GUI_STATUS_MAX_RECOGNIZED_ITEMS,
     GUI_STATUS_SIDEBAR_WIDTH,
     STATUS_TEXT_TRUNCATION_SUFFIX,
+    STATUS_LOG_WRAP_WIDTH,
+    STATUS_MAX_STABILITY_EVENTS,
+    STATUS_PANEL_COMPACT_MODE,
+    STATUS_PANEL_SHOW_RECOGNIZED_LISTS,
 )
 
 
@@ -20,6 +24,8 @@ def trim_id(card_id, max_len=34):
 
 
 def draw_text(panel, text, x, y, scale=0.48, color=(230, 230, 230), thickness=1):
+    if y < 0 or y >= panel.shape[0] - 4:
+        return
     cv2.putText(
         panel,
         text,
@@ -147,6 +153,10 @@ def draw_match_list(panel, title, matches, y):
             diag += " sig?"
         if match.get("last_signature_distance") is not None:
             diag += f" sig{match.get('last_signature_distance'):.2f}"
+        if match.get("last_raw_visual_diff") is not None:
+            diag += f" raw{match.get('last_raw_visual_diff'):.2f}"
+        if match.get("raw_visual_change_pending"):
+            diag += " raw!"
         if match.get("missing_seconds", 0.0) > 0.2:
             diag += f" miss{match.get('missing_seconds', 0.0):.1f}"
 
@@ -221,6 +231,35 @@ def draw_last_sent(panel, queue_snapshot, y):
     return y + 8
 
 
+def clean_event_text(event):
+    text = str(event)
+
+    if " message=" in text:
+        text = text.split(" message=", 1)[1]
+
+    return text.replace(" event=human_", " ")
+
+
+def wrap_words(text, width):
+    words = str(text).split()
+    lines = []
+    current = ""
+
+    for word in words:
+        if not current:
+            current = word
+        elif len(current) + 1 + len(word) <= width:
+            current += " " + word
+        else:
+            lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines or [""]
+
+
 def draw_stability_events(panel, events, y):
     draw_section_header(panel, "Stability Log", y)
     y += 26
@@ -229,9 +268,18 @@ def draw_stability_events(panel, events, y):
         draw_text(panel, "no recent events", 16, y, scale=0.38, color=(150, 150, 150))
         return y + 24
 
-    for event in events[-5:]:
-        draw_text(panel, trim_id(event, 48), 16, y, scale=0.34, color=(155, 155, 155))
-        y += 15
+    shown = 0
+    # Prefer human-readable events if present.
+    human_events = [event for event in events if "human_" in str(event)]
+    source_events = human_events if human_events else events
+
+    for event in source_events[-STATUS_MAX_STABILITY_EVENTS:]:
+        text = clean_event_text(event)
+        for line in wrap_words(text, STATUS_LOG_WRAP_WIDTH)[:3]:
+            draw_text(panel, line, 16, y, scale=0.34, color=(170, 170, 170))
+            y += 15
+        y += 4
+        shown += 1
 
     return y + 8
 
@@ -250,10 +298,15 @@ def make_status_sidebar(height, status):
 
     queue_snapshot = status.get("obs_queue", {})
     y = draw_queue(panel, queue_snapshot, y)
-    y = draw_last_sent(panel, queue_snapshot, y)
 
-    matches = status.get("matches", {})
-    y = draw_match_list(panel, "Left / Pink Recognized", matches.get("left", []), y)
-    y = draw_match_list(panel, "Right / Blue Recognized", matches.get("right", []), y)
+    if not STATUS_PANEL_COMPACT_MODE:
+        y = draw_last_sent(panel, queue_snapshot, y)
+
+    if STATUS_PANEL_SHOW_RECOGNIZED_LISTS:
+        matches = status.get("matches", {})
+        if y < height - 80:
+            y = draw_match_list(panel, "Left Recognized", matches.get("left", []), y)
+        if y < height - 80:
+            y = draw_match_list(panel, "Right Recognized", matches.get("right", []), y)
 
     return panel

@@ -7,8 +7,9 @@ from .config import (
     SCANNER_WORKER_DROP_DUPLICATE_SIDE_REQUESTS,
     SIDE_SCAN_COOLDOWN_SECONDS,
 )
-from .recognition import scan_side_for_matches, scan_point_for_card
+from .recognition import scan_side_for_matches, scan_point_for_card, scan_box_for_card
 from .perf import now, record, increment
+from .console_utils import print_error
 
 
 class ScannerWorker:
@@ -85,6 +86,24 @@ class ScannerWorker:
             increment("dropped_jobs")
             return False
 
+
+    def request_box_scan(self, frame, x1, y1, x2, y2, side):
+        job = {
+            "frame": frame.copy(),
+            "x1": int(x1),
+            "y1": int(y1),
+            "x2": int(x2),
+            "y2": int(y2),
+            "side": str(side),
+        }
+
+        try:
+            self.jobs.put_nowait(("box", job))
+            return True
+        except queue.Full:
+            increment("dropped_jobs")
+            return False
+
     def _run(self):
         while self.running:
             kind, job = self.jobs.get()
@@ -116,11 +135,23 @@ class ScannerWorker:
                     )
                     record("worker_point_ms", (now() - start) * 1000.0)
 
+                elif kind == "box":
+                    scan_box_for_card(
+                        job["frame"],
+                        job["x1"],
+                        job["y1"],
+                        job["x2"],
+                        job["y2"],
+                        job["side"],
+                        self.catalog,
+                    )
+                    record("worker_point_ms", (now() - start) * 1000.0)
+
                 increment("processed_jobs")
                 record("queued_jobs", self.jobs.qsize())
 
             except Exception as exc:
-                print(f"Scanner worker error: {exc}")
+                print_error(f"Scanner worker error: {exc}", exc)
                 if kind == "side":
                     with self.lock:
                         self.pending_sides.discard(job.get("side"))

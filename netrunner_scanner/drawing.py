@@ -1,6 +1,6 @@
 
 import cv2
-from .config import HANDLE_SIZE
+from .config import HANDLE_SIZE, DRAW_LABEL_SHADOWS, ROI_LEFT_LABEL, ROI_RIGHT_LABEL, ROI_LEFT_LABEL, ROI_RIGHT_LABEL
 
 ROI_LEFT_COLOR = (0, 255, 0)
 ROI_RIGHT_COLOR = (255, 0, 0)
@@ -14,15 +14,41 @@ UNDISPLAYED_COLOR = (255, 0, 255)
 CARD_BACK_COLOR = (200, 200, 200)
 
 
+def draw_label(frame, text, origin, color, scale=0.58, thickness=2):
+    x, y = origin
+    if DRAW_LABEL_SHADOWS:
+        cv2.putText(
+            frame,
+            text,
+            (x + 2, y + 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (0, 0, 0),
+            thickness + 1,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        frame,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def draw_roi(frame, side, roi):
     x, y, w, h = roi
 
     if side == "left":
         color = ROI_LEFT_COLOR
-        label = "LEFT / PINK"
+        label = ROI_LEFT_LABEL
     else:
         color = ROI_RIGHT_COLOR
-        label = "RIGHT / BLUE"
+        label = ROI_RIGHT_LABEL
 
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
@@ -35,15 +61,7 @@ def draw_roi(frame, side, roi):
             -1,
         )
 
-    cv2.putText(
-        frame,
-        label,
-        (x + 12, y + 32),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        color,
-        2,
-    )
+    draw_label(frame, label, (x + 12, y + 32), color, scale=0.82, thickness=2)
 
 
 def is_known_card_label(label):
@@ -134,12 +152,4 @@ def draw_card_matches(frame, matches):
         if text_y < 20:
             text_y = y + h + 22
 
-        cv2.putText(
-            frame,
-            text,
-            (text_x, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-        )
+        draw_label(frame, text, (text_x, text_y), color, scale=0.58, thickness=2)

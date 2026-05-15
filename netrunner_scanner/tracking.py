@@ -9,6 +9,12 @@ from .config import (
     TRACK_REACQUIRE_CENTER_THRESHOLD_PX,
     TRACK_REQUEUE_CENTER_THRESHOLD_PX,
     TRACK_REUSE_AFTER_MISSING_SECONDS,
+    MOVED_SANITY_RESCAN_ENABLED,
+    MOVED_SANITY_RESCAN_PX,
+    MOVED_SANITY_RESCAN_COOLDOWN_SECONDS,
+    MOVED_REIDENTIFY_ENABLED,
+    MOVED_REIDENTIFY_MIN_PX,
+    MOVED_REIDENTIFY_COOLDOWN_SECONDS,
 )
 from .stability import log_event, log_human_event
 
@@ -176,6 +182,15 @@ class CardTracker:
                 "force_new_identification": False,
                 "needs_same_spot_signature_check": False,
                 "last_decision": "new_track",
+                "last_moved_rescan_at": 0.0,
+                "last_visual_recheck_at": 0.0,
+                "last_signature_distance": None,
+                "last_raw_signature": None,
+                "pending_raw_signature": None,
+                "last_raw_visual_diff": None,
+                "last_raw_visual_diff_at": 0.0,
+                "raw_visual_change_pending": False,
+                "forced_visual_change_at": 0.0,
             }
             self.next_track_id += 1
             self.tracks[side].append(track)
@@ -205,13 +220,31 @@ class CardTracker:
             and moved_px < TRACK_REQUEUE_CENTER_THRESHOLD_PX
         )
 
-        if moved_replacement_like:
-            track["displayed"] = False
-            track["queued"] = False
-            track["refined_box"] = None
+        moved_sanity_check = (
+            MOVED_SANITY_RESCAN_ENABLED
+            and moved_px >= MOVED_SANITY_RESCAN_PX
+            and now - float(track.get("last_moved_rescan_at", 0.0)) >= MOVED_SANITY_RESCAN_COOLDOWN_SECONDS
+        )
+
+        moved_reidentify_check = (
+            MOVED_REIDENTIFY_ENABLED
+            and moved_px >= MOVED_REIDENTIFY_MIN_PX
+            and now - float(track.get("last_moved_rescan_at", 0.0)) >= MOVED_REIDENTIFY_COOLDOWN_SECONDS
+        )
+
+        if moved_replacement_like or moved_sanity_check or moved_reidentify_check:
+            # Keep the old overlay visible while the fresh ID is pending. Clearing
+            # it here made normal movement look like the track had dropped.
             track["force_new_identification"] = True
             track["needs_same_spot_signature_check"] = False
-            track["last_decision"] = f"moved_replacement_check missing={missing_seconds:.2f} moved={moved_px:.1f}"
+            track["last_moved_rescan_at"] = now
+            if moved_replacement_like:
+                kind = "moved_replacement_check"
+            elif moved_sanity_check:
+                kind = "moved_sanity_rescan"
+            else:
+                kind = "moved_reidentify"
+            track["last_decision"] = f"{kind} missing={missing_seconds:.2f} moved={moved_px:.1f}"
             log_event(
                 side,
                 track["track_id"],
@@ -219,7 +252,7 @@ class CardTracker:
                 label=track.get("label"),
                 missing=f"{missing_seconds:.2f}",
                 moved=f"{moved_px:.1f}",
-                kind="moved",
+                kind=kind,
             )
             log_human_event(
                 side,
@@ -360,6 +393,12 @@ class CardTracker:
                 "force_new_identification": track.get("force_new_identification", False),
                 "last_decision": track.get("last_decision", ""),
                 "needs_same_spot_signature_check": track.get("needs_same_spot_signature_check", False),
+                "last_moved_rescan_at": track.get("last_moved_rescan_at", 0.0),
+                "last_visual_recheck_at": track.get("last_visual_recheck_at", 0.0),
+                "last_signature_distance": track.get("last_signature_distance"),
+                "last_raw_visual_diff": track.get("last_raw_visual_diff"),
+                "raw_visual_change_pending": track.get("raw_visual_change_pending", False),
+                "forced_visual_change_at": track.get("forced_visual_change_at", 0.0),
             })
 
         return matches

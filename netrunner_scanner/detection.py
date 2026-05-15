@@ -33,6 +33,15 @@ from .config import (
     INNER_BOX_OVERLAP_REJECTION_ENABLED,
     INNER_BOX_OVERLAP_THRESHOLD,
     INNER_BOX_MAX_AREA_RATIO,
+    RELATIVE_CARD_SIZE_FILTER_ENABLED,
+    RELATIVE_CARD_SIZE_MIN_AREA_FRACTION,
+    RELATIVE_CARD_SIZE_MIN_SHORT_SIDE_FRACTION,
+    RELATIVE_CARD_SIZE_MIN_REFERENCE_CARDS,
+    PARTIAL_CARD_REJECT_ENABLED,
+    PARTIAL_CARD_MIN_AREA_FRACTION,
+    PARTIAL_CARD_MIN_SHORT_SIDE_FRACTION,
+    PARTIAL_CARD_REFERENCE_TOP_N,
+    PARTIAL_CARD_MIN_REFERENCES,
 )
 
 
@@ -251,6 +260,118 @@ def filter_by_whole_card_size(candidates):
     return filtered
 
 
+def filter_relative_card_sizes(candidates):
+    if not RELATIVE_CARD_SIZE_FILTER_ENABLED:
+        return candidates
+
+    normal = [
+        candidate
+        for candidate in candidates
+        if candidate.get("source") not in ("solid_back", "manual_click", "manual_drag")
+    ]
+
+    if len(normal) < RELATIVE_CARD_SIZE_MIN_REFERENCE_CARDS:
+        return candidates
+
+    areas = []
+    short_sides = []
+
+    for candidate in normal:
+        _x, _y, w, h, rect_area = candidate_area_rect(candidate)
+        if rect_area <= 0:
+            continue
+        areas.append(float(rect_area))
+        short_sides.append(float(min(w, h)))
+
+    if len(areas) < RELATIVE_CARD_SIZE_MIN_REFERENCE_CARDS:
+        return candidates
+
+    # Use the top half so a partial art/text box cannot drag the reference down.
+    areas_sorted = sorted(areas, reverse=True)
+    shorts_sorted = sorted(short_sides, reverse=True)
+    take = max(RELATIVE_CARD_SIZE_MIN_REFERENCE_CARDS, len(areas_sorted) // 2)
+
+    reference_area = float(np.median(areas_sorted[:take]))
+    reference_short = float(np.median(shorts_sorted[:take]))
+
+    min_area = reference_area * RELATIVE_CARD_SIZE_MIN_AREA_FRACTION
+    min_short = reference_short * RELATIVE_CARD_SIZE_MIN_SHORT_SIDE_FRACTION
+
+    filtered = []
+
+    for candidate in candidates:
+        if candidate.get("source") in ("solid_back", "manual_click", "manual_drag"):
+            filtered.append(candidate)
+            continue
+
+        _x, _y, w, h, rect_area = candidate_area_rect(candidate)
+        short_side = min(w, h)
+
+        if rect_area >= min_area and short_side >= min_short:
+            filtered.append(candidate)
+        else:
+            candidate["rejected_reason"] = (
+                f"relative_size area={rect_area:.0f}/{min_area:.0f} "
+                f"short={short_side:.0f}/{min_short:.0f}"
+            )
+
+    return filtered
+
+
+def reject_partial_card_boxes(candidates):
+    if not PARTIAL_CARD_REJECT_ENABLED:
+        return candidates
+
+    normal = [
+        candidate
+        for candidate in candidates
+        if candidate.get("source") not in ("solid_back", "manual_click", "manual_drag")
+    ]
+
+    if len(normal) < PARTIAL_CARD_MIN_REFERENCES:
+        return candidates
+
+    measures = []
+
+    for candidate in normal:
+        _x, _y, w, h, rect_area = candidate_area_rect(candidate)
+        if rect_area <= 0:
+            continue
+        measures.append((float(rect_area), float(min(w, h))))
+
+    if len(measures) < PARTIAL_CARD_MIN_REFERENCES:
+        return candidates
+
+    measures.sort(key=lambda item: item[0], reverse=True)
+    reference = measures[:max(PARTIAL_CARD_MIN_REFERENCES, min(PARTIAL_CARD_REFERENCE_TOP_N, len(measures)))]
+
+    ref_area = float(np.median([item[0] for item in reference]))
+    ref_short = float(np.median([item[1] for item in reference]))
+
+    min_area = ref_area * PARTIAL_CARD_MIN_AREA_FRACTION
+    min_short = ref_short * PARTIAL_CARD_MIN_SHORT_SIDE_FRACTION
+
+    filtered = []
+
+    for candidate in candidates:
+        if candidate.get("source") in ("solid_back", "manual_click", "manual_drag"):
+            filtered.append(candidate)
+            continue
+
+        _x, _y, w, h, rect_area = candidate_area_rect(candidate)
+        short_side = float(min(w, h))
+
+        if rect_area >= min_area and short_side >= min_short:
+            filtered.append(candidate)
+        else:
+            candidate["rejected_reason"] = (
+                f"partial_card area={rect_area:.0f}/{min_area:.0f} "
+                f"short={short_side:.0f}/{min_short:.0f}"
+            )
+
+    return filtered
+
+
 def non_max_suppression(candidates):
     kept = []
 
@@ -461,7 +582,10 @@ def solid_back_candidates(frame, roi, gray_roi):
     blurred = cv2.GaussianBlur(lab, (41, 41), 0)
 
     diff = lab.astype(np.int16) - blurred.astype(np.int16)
-    dist = np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
+    sq = np.sum(diff.astype(np.float32) * diff.astype(np.float32), axis=2)
+    sq = np.nan_to_num(sq, nan=0.0, posinf=0.0, neginf=0.0)
+    sq = np.maximum(sq, 0.0)
+    dist = np.sqrt(sq).astype(np.float32)
 
     mask = (dist > SOLID_BACK_MIN_COLOR_DISTANCE).astype(np.uint8) * 255
 
@@ -569,6 +693,8 @@ def find_card_candidates(frame, roi):
     candidates = suppress_nested_and_composite_candidates(candidates)
     candidates = suppress_inner_overlap_boxes(candidates)
     candidates = filter_by_whole_card_size(candidates)
+    candidates = filter_relative_card_sizes(candidates)
+    candidates = reject_partial_card_boxes(candidates)
     candidates = non_max_suppression(candidates)
 
     candidates.sort(key=lambda c: c.get("area", 0.0), reverse=True)

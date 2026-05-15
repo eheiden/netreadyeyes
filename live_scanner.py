@@ -16,6 +16,7 @@ from netrunner_scanner.config import (
     GUI_DISPLAY_SCALE,
     GUI_TARGET_FPS,
     OPENCV_NUM_THREADS,
+    EXIT_ON_WINDOW_CLOSE,
 )
 from netrunner_scanner.camera import open_camera
 from netrunner_scanner.catalog import CardCatalog
@@ -26,9 +27,10 @@ from netrunner_scanner.motion import MotionGate
 from netrunner_scanner.overlay_server import start_overlay_server
 from netrunner_scanner.status_panel import make_status_sidebar
 from netrunner_scanner.display_utils import fit_image_to_window
-from netrunner_scanner.card_actions import make_mouse_handler, draw_card_menu, handle_card_menu_key
+from netrunner_scanner.card_actions import make_mouse_handler, draw_card_menu, draw_manual_drag_box, handle_card_menu_key
 from netrunner_scanner.scanner_worker import ScannerWorker
 from netrunner_scanner.perf import now as perf_now, record as perf_record, start_thread_cpu_monitor
+from netrunner_scanner.console_utils import print_error
 
 
 def main():
@@ -66,6 +68,13 @@ def main():
     def get_current_frame_size():
         return current_frame_size[0], current_frame_size[1]
 
+    def submit_box_scan(frame, x1, y1, x2, y2, side):
+        if worker is not None:
+            worker.request_box_scan(frame, x1, y1, x2, y2, side)
+        else:
+            from netrunner_scanner.recognition import scan_box_for_card
+            scan_box_for_card(frame, x1, y1, x2, y2, side, catalog)
+
     def submit_point_scan(frame, x, y, side):
         if worker is not None:
             worker.request_point_scan(frame, x, y, side)
@@ -76,8 +85,9 @@ def main():
     print("\\nControls:")
     print("Mouse drag inside box = move ROI")
     print("Mouse drag edge/corner = resize ROI")
-    print("Click card = actions menu")
-    print("Click empty ROI area = manual point scan")
+    print("Left-click card = force to OBS front")
+    print("Right-click card = actions menu")
+    print("Left-click/drag empty ROI area = manual box scan")
     print("Q = manually scan LEFT / pink playmat")
     print("E = manually scan RIGHT / blue playmat")
     print("S = save ROI settings")
@@ -108,7 +118,7 @@ def main():
 
                 cv2.setMouseCallback(
                     WINDOW_NAME,
-                    make_mouse_handler(get_current_frame_size, get_current_frame, catalog, submit_point_scan),
+                    make_mouse_handler(get_current_frame_size, get_current_frame, catalog, submit_point_scan, submit_box_scan),
                     param=None,
                 )
 
@@ -142,6 +152,7 @@ def main():
             draw_roi(display_frame, "right", rois["right"])
             draw_card_matches(display_frame, latest_matches["left"])
             draw_card_matches(display_frame, latest_matches["right"])
+            draw_manual_drag_box(display_frame)
             draw_card_menu(display_frame)
 
             if GUI_DISPLAY_SCALE != 1.0:
@@ -163,6 +174,13 @@ def main():
             cv2.imshow(WINDOW_NAME, display_frame)
 
             key = cv2.waitKey(1) & 0xFF
+
+            if EXIT_ON_WINDOW_CLOSE:
+                try:
+                    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except cv2.error:
+                    break
 
             if handle_card_menu_key(key):
                 continue
@@ -210,4 +228,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print_error("Fatal scanner error", exc)
+        raise

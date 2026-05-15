@@ -35,12 +35,44 @@ from .config import (
     MANUAL_CLICK_MIN_CENTER_EDGE_RATIO,
     MANUAL_CLICK_REQUIRE_DETAIL,
     HIDE_STALE_MANUAL_MISSES,
+    MANUAL_DRAG_EXPAND_RATIO,
+    STABLE_VISUAL_RECHECK_ENABLED,
+    STABLE_VISUAL_RECHECK_INTERVAL_SECONDS,
+    STABLE_VISUAL_RECHECK_DIFFERENT_THRESHOLD,
+    STABLE_VISUAL_RECHECK_SAME_THRESHOLD,
+    STABLE_VISUAL_RECHECK_MAX_PER_SCAN,
+    VISUAL_RECHECK_USE_RAW_PROPOSAL,
+    VISUAL_RECHECK_LOG_EVERY_CHECK,
+    VISUAL_RECHECK_FORCE_PROCESS_THIS_SCAN,
+    MANUAL_BOX_FIND_CANDIDATES_FIRST,
+    MANUAL_BOX_PRESERVE_VISIBLE_MATCHES,
+    MANUAL_BOX_MIN_CANDIDATE_AREA,
+    MANUAL_BOX_EXPAND_SEARCH_PX,
+    MANUAL_DRAG_FORCE_FRONT,
+    MANUAL_SCAN_RELAX_THRESHOLDS,
+    MANUAL_SCAN_EXPAND_PX,
+    MANUAL_CLICK_CARD_WIDTH_PX,
+    MANUAL_CLICK_CARD_HEIGHT_PX,
     SAME_SPOT_SIGNATURE_CHECK_ENABLED,
     SAME_SPOT_SIGNATURE_SAME_THRESHOLD,
     SAME_SPOT_SIGNATURE_DIFFERENT_THRESHOLD,
     HOLD_KNOWN_ON_CARDBACK_MISREAD,
     HOLD_KNOWN_ON_ANY_LOW_CONFIDENCE_MISREAD,
     STABILITY_VERBOSE_RECOGNITION_LOGS,
+    ALWAYS_RAW_VISUAL_DIFF_ENABLED,
+    RAW_VISUAL_DIFF_SIZE,
+    RAW_VISUAL_DIFF_THRESHOLD,
+    RAW_VISUAL_DIFF_LOG_THRESHOLD,
+    RAW_VISUAL_DIFF_COOLDOWN_SECONDS,
+    RAW_VISUAL_DIFF_FORCE_PRIORITY,
+    HOLD_KNOWN_ON_FORCED_UNKNOWN,
+    HOLD_KNOWN_ON_FORCED_LOW_SCORE,
+    ALLOW_CARDBACK_ON_FORCED_VISUAL_CHANGE,
+    FORCED_VISUAL_CHANGE_RETRY_SECONDS,
+    MANUAL_POINT_CREATE_UNKNOWN_TRACK,
+    MANUAL_POINT_FORCE_FRONT,
+    MANUAL_POINT_EXPAND_SEARCH_PX,
+    MANUAL_POINT_MIN_CANDIDATE_AREA,
 )
 from .crop import crop_candidate
 from .detection import find_card_candidates
@@ -304,6 +336,133 @@ def candidate_visual_signature(frame, candidate):
 
     return visual_signature(refined["image"])
 
+def candidate_raw_visual_signature(frame, candidate):
+    crop = crop_candidate(frame, candidate)
+
+    if crop is None or crop.size == 0:
+        return None
+
+    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    return visual_signature(Image.fromarray(crop_rgb))
+
+
+def best_candidate_signature(frame, candidate):
+    if VISUAL_RECHECK_USE_RAW_PROPOSAL:
+        raw = candidate_raw_visual_signature(frame, candidate)
+        if raw is not None:
+            return raw
+
+    return candidate_visual_signature(frame, candidate)
+
+
+def raw_visual_signature_from_candidate(frame, candidate):
+    crop = crop_candidate(frame, candidate)
+
+    if crop is None or crop.size == 0:
+        return None
+
+    size = int(RAW_VISUAL_DIFF_SIZE)
+    if size < 4:
+        size = 16
+
+    small = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+    # Keep this deliberately tiny. It runs for stable known tracks before the
+    # expensive recognition path and is meant only to answer: "same picture?"
+    return {
+        "gray": gray,
+        "sat": hsv[:, :, 1].astype(np.float32) / 255.0,
+        "val": hsv[:, :, 2].astype(np.float32) / 255.0,
+    }
+
+
+def raw_visual_signature_distance(a, b):
+    if a is None or b is None:
+        return 1.0
+
+    gray_dist = float(np.mean(np.abs(a["gray"] - b["gray"])))
+    sat_dist = float(np.mean(np.abs(a["sat"] - b["sat"])))
+    val_dist = float(np.mean(np.abs(a["val"] - b["val"])))
+
+    return gray_dist * 0.70 + sat_dist * 0.18 + val_dist * 0.12
+
+
+def update_raw_visual_state(frame, candidate, track, side, label, now_time):
+    if not ALWAYS_RAW_VISUAL_DIFF_ENABLED:
+        return False
+
+    current = raw_visual_signature_from_candidate(frame, candidate)
+
+    if current is None:
+        return False
+
+    previous = track.get("last_raw_signature")
+
+    if previous is None:
+        track["last_raw_signature"] = current
+        track["last_raw_visual_diff"] = 0.0
+        return False
+
+    distance = raw_visual_signature_distance(previous, current)
+    track["last_raw_visual_diff"] = distance
+
+    known_or_back = label not in (None, "", "unknown", "tracking")
+    cooldown_ok = (
+        now_time - float(track.get("last_raw_visual_diff_at", 0.0))
+        >= RAW_VISUAL_DIFF_COOLDOWN_SECONDS
+    )
+
+    if known_or_back and distance >= RAW_VISUAL_DIFF_THRESHOLD and cooldown_ok:
+        track["pending_raw_signature"] = current
+        track["last_raw_visual_diff_at"] = now_time
+        track["forced_visual_change_at"] = now_time
+        track["raw_visual_change_pending"] = True
+        track["force_new_identification"] = True
+        track["displayed"] = False
+        track["queued"] = False
+        track["refined_box"] = None
+        track["last_decision"] = f"raw_visual_change diff={distance:.3f}"
+
+        log_event(
+            side,
+            track.get("track_id"),
+            "raw_visual_change",
+            label=label,
+            diff=f"{distance:.3f}",
+            threshold=f"{RAW_VISUAL_DIFF_THRESHOLD:.3f}",
+            box=str(cv2.boundingRect(candidate["box"])),
+        )
+        log_human_event(
+            side,
+            track.get("track_id"),
+            "raw_visual_change",
+            label=label,
+            reason=f"raw visual diff {distance:.3f}",
+        )
+        return True
+
+    # If it is the same image, update the baseline slightly so lighting drift
+    # doesn't accumulate forever.
+    if distance < RAW_VISUAL_DIFF_LOG_THRESHOLD:
+        track["last_raw_signature"] = current
+        track["raw_visual_change_pending"] = False
+
+    elif known_or_back and cooldown_ok:
+        log_event(
+            side,
+            track.get("track_id"),
+            "raw_visual_same",
+            label=label,
+            diff=f"{distance:.3f}",
+            threshold=f"{RAW_VISUAL_DIFF_THRESHOLD:.3f}",
+        )
+
+    return False
+
+
 
 def scan_side_for_matches(frame, roi, side, catalog):
     candidates = find_card_candidates(frame, roi)
@@ -312,6 +471,7 @@ def scan_side_for_matches(frame, roi, side, catalog):
     considered = 0
     skipped_known = 0
     skipped_cooldown = 0
+    visual_rechecks_this_scan = 0
 
     for i, candidate in enumerate(candidates, start=1):
         considered += 1
@@ -323,6 +483,17 @@ def scan_side_for_matches(frame, roi, side, catalog):
         label = track.get("label")
         now_time = tracker.current_time()
 
+        raw_visual_changed = update_raw_visual_state(
+            frame=frame,
+            candidate=candidate,
+            track=track,
+            side=side,
+            label=label,
+            now_time=now_time,
+        )
+        if raw_visual_changed:
+            needs_processing = True
+
         # If this same physical location has not been scanned for a while, first
         # compare the new crop to the old lightweight signature. This avoids
         # the previous failure mode where a stable card was treated as a replacement
@@ -333,7 +504,7 @@ def scan_side_for_matches(frame, roi, side, catalog):
             and track.get("visual_signature") is not None
             and label not in (None, "", "unknown", "tracking", "card_back")
         ):
-            current_signature = candidate_visual_signature(frame, candidate)
+            current_signature = best_candidate_signature(frame, candidate)
             distance = visual_signature_distance(track.get("visual_signature"), current_signature)
             track["last_signature_distance"] = distance
 
@@ -364,6 +535,64 @@ def scan_side_for_matches(frame, roi, side, catalog):
                 skipped_known += 1
                 continue
 
+        # Stable known cards are mostly left alone, but a card flip can keep the
+        # same box with very little movement. Compare a lightweight raw proposal
+        # signature so card_back <-> face flips actually refresh.
+        if (
+            STABLE_VISUAL_RECHECK_ENABLED
+            and label not in (None, "", "unknown", "tracking")
+            and not track.get("force_new_identification", False)
+            and track.get("visual_signature") is not None
+            and now_time - float(track.get("last_visual_recheck_at", 0.0)) >= STABLE_VISUAL_RECHECK_INTERVAL_SECONDS
+            and visual_rechecks_this_scan < STABLE_VISUAL_RECHECK_MAX_PER_SCAN
+        ):
+            visual_rechecks_this_scan += 1
+            current_signature = best_candidate_signature(frame, candidate)
+            distance = visual_signature_distance(track.get("visual_signature"), current_signature)
+            track["last_signature_distance"] = distance
+            track["last_visual_recheck_at"] = now_time
+
+            if VISUAL_RECHECK_LOG_EVERY_CHECK:
+                log_event(
+                    side,
+                    track.get("track_id"),
+                    "visual_recheck",
+                    label=label,
+                    sig=f"{distance:.3f}",
+                    threshold=f"{STABLE_VISUAL_RECHECK_DIFFERENT_THRESHOLD:.3f}",
+                    box=str(cv2.boundingRect(candidate["box"])),
+                )
+
+            if distance >= STABLE_VISUAL_RECHECK_DIFFERENT_THRESHOLD:
+                track["force_new_identification"] = True
+                track["displayed"] = False
+                track["queued"] = False
+                track["refined_box"] = None
+                track["last_decision"] = f"visual_flip_recheck sig={distance:.3f}"
+                log_event(
+                    side,
+                    track.get("track_id"),
+                    "visual_flip_recheck",
+                    label=label,
+                    sig=f"{distance:.3f}",
+                    threshold=f"{STABLE_VISUAL_RECHECK_DIFFERENT_THRESHOLD:.3f}",
+                )
+                log_human_event(
+                    side,
+                    track.get("track_id"),
+                    "visual_flip_recheck",
+                    label=label,
+                    sig=f"{distance:.3f}",
+                    reason=f"visual signature changed by {distance:.3f}",
+                )
+
+                if VISUAL_RECHECK_FORCE_PROCESS_THIS_SCAN:
+                    needs_processing = True
+            else:
+                track["last_decision"] = f"visual_same sig={distance:.3f}"
+                skipped_known += 1
+                continue
+
         # Stable known cards are left alone unless the tracker explicitly marked
         # this proposal as a possible replacement. This is the main anti-flicker rule.
         if (
@@ -379,6 +608,12 @@ def scan_side_for_matches(frame, roi, side, catalog):
                 skipped_cooldown += 1
                 continue
 
+        if track.get("raw_visual_change_pending", False):
+            last_attempt = float(track.get("last_processed_at", 0.0))
+            if last_attempt > 0 and now_time - last_attempt < FORCED_VISUAL_CHANGE_RETRY_SECONDS:
+                skipped_cooldown += 1
+                continue
+
         if label in (None, "", "tracking"):
             last_attempt = float(track.get("last_processed_at", 0.0))
             if last_attempt > 0 and now_time - last_attempt < TRACKING_RETRY_COOLDOWN_SECONDS:
@@ -390,7 +625,7 @@ def scan_side_for_matches(frame, roi, side, catalog):
             and not DISABLE_STABLE_SIGNATURE_RECHECK
             and track.get("visual_signature") is not None
         ):
-            current_signature = candidate_visual_signature(frame, candidate)
+            current_signature = best_candidate_signature(frame, candidate)
             distance = visual_signature_distance(track.get("visual_signature"), current_signature)
 
             if distance >= VISUAL_SIGNATURE_FORCE_RECHECK_THRESHOLD:
@@ -404,9 +639,11 @@ def scan_side_for_matches(frame, roi, side, catalog):
             skipped_known += 1
             continue
 
-        if label in (None, "", "tracking"):
-            priority = 0
+        if track.get("raw_visual_change_pending", False) and RAW_VISUAL_DIFF_FORCE_PRIORITY:
+            priority = -1
         elif track.get("force_new_identification", False):
+            priority = 0
+        elif label in (None, "", "tracking"):
             priority = 1
         elif label == "unknown":
             priority = 2
@@ -441,15 +678,27 @@ def scan_side_for_matches(frame, roi, side, catalog):
         # more useful for production than a flickering unknown/card_back box.
         weak_replacement_read = False
 
-        if best is not None and previous_known and not forced_new:
+        raw_forced = bool(track.get("raw_visual_change_pending", False))
+
+        if best is not None and previous_known:
             best_id = best.get("id")
             best_score = float(best.get("score", 0.0))
 
-            if best_id == "unknown":
+            if best_id == "unknown" and (not forced_new or HOLD_KNOWN_ON_FORCED_UNKNOWN):
                 weak_replacement_read = True
-            elif HOLD_KNOWN_ON_CARDBACK_MISREAD and best_id == "card_back":
+            elif (
+                HOLD_KNOWN_ON_CARDBACK_MISREAD
+                and best_id == "card_back"
+                and previous_label != "card_back"
+                and not (raw_forced and ALLOW_CARDBACK_ON_FORCED_VISUAL_CHANGE)
+            ):
                 weak_replacement_read = True
-            elif HOLD_KNOWN_ON_ANY_LOW_CONFIDENCE_MISREAD and best_score < CONFIDENCE_THRESHOLD:
+            elif (
+                HOLD_KNOWN_ON_ANY_LOW_CONFIDENCE_MISREAD
+                and best_score < CONFIDENCE_THRESHOLD
+                and (not forced_new or HOLD_KNOWN_ON_FORCED_LOW_SCORE)
+                and not (raw_forced and best_id not in ("unknown", None, ""))
+            ):
                 weak_replacement_read = True
 
         if weak_replacement_read:
@@ -484,6 +733,13 @@ def scan_side_for_matches(frame, roi, side, catalog):
 
         tracker.apply_recognition_result(track, best)
         track["force_new_identification"] = False
+
+        if best is not None and best.get("id") not in (None, "", "unknown"):
+            pending_raw = track.get("pending_raw_signature")
+            if pending_raw is not None:
+                track["last_raw_signature"] = pending_raw
+                track["pending_raw_signature"] = None
+            track["raw_visual_change_pending"] = False
 
         current_label = track.get("label")
         current_score = float(track.get("score", 0.0))
@@ -559,6 +815,24 @@ def get_scanner_status():
     }
 
 
+def refresh_latest_matches_preserving(side, before_matches):
+    refreshed = tracker.get_visible_matches(side)
+
+    if not before_matches:
+        latest_matches[side] = refreshed
+        return
+
+    by_id = {match.get("track_id"): match for match in refreshed}
+    merged = []
+
+    for old_match in before_matches:
+        track_id = old_match.get("track_id")
+        merged.append(by_id.pop(track_id, old_match))
+
+    merged.extend(by_id.values())
+    latest_matches[side] = merged
+
+
 
 def manual_candidate_at_point(x, y, width=None, height=None):
     from .config import MANUAL_CLICK_CARD_WIDTH_PX, MANUAL_CLICK_CARD_HEIGHT_PX
@@ -588,11 +862,173 @@ def manual_candidate_at_point(x, y, width=None, height=None):
         "source": "manual_click",
     }
 
+def best_manual_candidate_in_box(frame, x1, y1, x2, y2, side):
+    from .roi import rois
+
+    left = max(0, int(min(x1, x2)) - MANUAL_BOX_EXPAND_SEARCH_PX)
+    right = min(frame.shape[1] - 1, int(max(x1, x2)) + MANUAL_BOX_EXPAND_SEARCH_PX)
+    top = max(0, int(min(y1, y2)) - MANUAL_BOX_EXPAND_SEARCH_PX)
+    bottom = min(frame.shape[0] - 1, int(max(y1, y2)) + MANUAL_BOX_EXPAND_SEARCH_PX)
+
+    if right <= left or bottom <= top:
+        return None
+
+    # Use a temporary ROI clipped to the user's drawn/search area. This means the
+    # user's big green rectangle is a search hint, not the final card box.
+    roi = [left, top, right - left, bottom - top]
+    candidates = find_card_candidates(frame, roi)
+
+    if not candidates:
+        return None
+
+    cx = (left + right) / 2.0
+    cy = (top + bottom) / 2.0
+
+    scored = []
+    for candidate in candidates:
+        area = float(candidate.get("area", 0.0))
+        if area < MANUAL_BOX_MIN_CANDIDATE_AREA:
+            continue
+
+        bx, by, bw, bh = cv2.boundingRect(candidate["box"])
+        ccx = bx + bw / 2.0
+        ccy = by + bh / 2.0
+        distance = ((ccx - cx) ** 2 + (ccy - cy) ** 2) ** 0.5
+        scored.append((distance, -area, candidate))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: (item[0], item[1]))
+    candidate = scored[0][2]
+    candidate["source"] = "manual_box_candidate"
+    return candidate
+
+
+
+def manual_candidate_from_rect(x1, y1, x2, y2):
+    import numpy as _np
+
+    left = int(min(x1, x2))
+    right = int(max(x1, x2))
+    top = int(min(y1, y2))
+    bottom = int(max(y1, y2))
+
+    w = max(1, right - left)
+    h = max(1, bottom - top)
+
+    expand_x = int(w * MANUAL_DRAG_EXPAND_RATIO)
+    expand_y = int(h * MANUAL_DRAG_EXPAND_RATIO)
+
+    left -= expand_x
+    right += expand_x
+    top -= expand_y
+    bottom += expand_y
+
+    box = _np.array(
+        [
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+        ],
+        dtype=_np.intp,
+    )
+
+    return {
+        "box": box,
+        "area": float(max(1, right - left) * max(1, bottom - top)),
+        "source": "manual_drag",
+    }
+
+
+def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog):
+    before_matches = list(latest_matches.get(side, []))
+
+    search_x1, search_y1, search_x2, search_y2 = x1, y1, x2, y2
+
+    if MANUAL_SCAN_RELAX_THRESHOLDS:
+        search_x1 = max(0, x1 - MANUAL_SCAN_EXPAND_PX)
+        search_y1 = max(0, y1 - MANUAL_SCAN_EXPAND_PX)
+        search_x2 = min(frame.shape[1] - 1, x2 + MANUAL_SCAN_EXPAND_PX)
+        search_y2 = min(frame.shape[0] - 1, y2 + MANUAL_SCAN_EXPAND_PX)
+
+    candidate = None
+
+    if MANUAL_BOX_FIND_CANDIDATES_FIRST:
+        candidate = best_manual_candidate_in_box(
+            frame,
+            search_x1,
+            search_y1,
+            search_x2,
+            search_y2,
+            side,
+        )
+
+    if candidate is None:
+        candidate = manual_candidate_from_rect(search_x1, search_y1, search_x2, search_y2)
+
+    track, _needs_processing = tracker.update_or_create_track(side=side, box=candidate["box"])
+    track["force_new_identification"] = True
+    track["last_decision"] = f"manual_box_scan source={candidate.get('source')}"
+    best = recognize_candidate_crop(frame, candidate, side, 998, catalog)
+
+    if best is None and MANUAL_SCAN_RELAX_THRESHOLDS:
+        candidate["source"] = "manual_drag_relaxed"
+        best = recognize_candidate_crop(frame, candidate, side, 999, catalog)
+
+    previous_label = track.get("label")
+    tracker.apply_recognition_result(track, best)
+
+    current_label = track.get("label")
+    current_score = float(track.get("score", 0.0))
+
+    if (
+        current_label
+        and current_label not in ("unknown", "card_back")
+        and current_score >= CONFIDENCE_THRESHOLD
+        and not track.get("queued", False)
+    ):
+        if OBS_QUEUE_ENABLED:
+            if MANUAL_DRAG_FORCE_FRONT:
+                obs_queue.enqueue_front(
+                    side=side,
+                    card_id=current_label,
+                    score=current_score,
+                    track=track,
+                )
+            else:
+                obs_queue.enqueue_match(
+                    side=side,
+                    card_id=current_label,
+                    score=current_score,
+                    track=track,
+                )
+        elif AUTO_SEND_TO_OBS:
+            send_match_to_obs(side, current_label)
+
+    if MANUAL_BOX_PRESERVE_VISIBLE_MATCHES:
+        refresh_latest_matches_preserving(side, before_matches)
+    else:
+        latest_matches[side] = tracker.get_visible_matches(side)
+
+    log_event(
+        side,
+        track.get("track_id"),
+        "manual_box_scan",
+        source=candidate.get("source"),
+        old=previous_label,
+        new=current_label,
+        score=f"{current_score:.2f}",
+    )
+    return track
+
 
 def scan_point_for_card(frame, x, y, side, catalog):
     from .roi import rois
     import cv2 as _cv2
 
+    before_matches = list(latest_matches.get(side, []))
     roi = rois.get(side)
 
     if roi is None:
@@ -610,33 +1046,60 @@ def scan_point_for_card(frame, x, y, side, catalog):
         containing.sort(key=lambda c: c.get("area", 0.0), reverse=True)
         candidate = containing[0]
     else:
-        candidate = manual_candidate_at_point(x, y)
+        # User clicked a missed card. Search a larger manual box around that point
+        # before falling back to a plain centered crop.
+        half_w = (MANUAL_CLICK_CARD_WIDTH_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
+        half_h = (MANUAL_CLICK_CARD_HEIGHT_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
+        candidate = best_manual_candidate_in_box(
+            frame,
+            x - half_w,
+            y - half_h,
+            x + half_w,
+            y + half_h,
+            side,
+        )
+        if candidate is None:
+            candidate = manual_candidate_at_point(x, y)
 
-    track, _needs_processing = tracker.update_or_create_track(side=side, box=candidate["box"])
+    # Recognize first. If this explicit click still produces no useful answer,
+    # preserve the existing overlays and do not create a temporary unknown box.
     best = recognize_candidate_crop(frame, candidate, side, 999, catalog)
 
-    if candidate.get("source") == "manual_click" and best is not None:
-        detail = best.get("detail_metrics") or {}
+    if best is None:
+        refresh_latest_matches_preserving(side, before_matches)
+        log_event(side, "manual", "manual_point_no_result", x=x, y=y, source=candidate.get("source"))
+        return None
 
-        if best.get("id") == "card_back" and not MANUAL_SCAN_ALLOW_CARDBACK:
-            # A click on blank mat often looks like a smooth card back. Do not
-            # create gray card-back boxes from manual clicks unless explicitly enabled.
-            if HIDE_STALE_MANUAL_MISSES:
-                try:
-                    tracker.tracks[side].remove(track)
-                except ValueError:
-                    pass
-            latest_matches[side] = tracker.get_visible_matches(side)
-            return None
+    best_id = best.get("id")
+    best_score = float(best.get("score", 0.0))
 
-        if not manual_crop_has_enough_detail(detail):
-            if HIDE_STALE_MANUAL_MISSES:
-                try:
-                    tracker.tracks[side].remove(track)
-                except ValueError:
-                    pass
-            latest_matches[side] = tracker.get_visible_matches(side)
-            return None
+    if not MANUAL_POINT_CREATE_UNKNOWN_TRACK and best_id in ("unknown", None, ""):
+        refresh_latest_matches_preserving(side, before_matches)
+        log_event(
+            side,
+            "manual",
+            "manual_point_no_useful_id",
+            x=x,
+            y=y,
+            best=best_id,
+            score=f"{best_score:.2f}",
+            reason=best.get("refine_reason"),
+            source=candidate.get("source"),
+        )
+        return None
+
+    if (
+        candidate.get("source") == "manual_click"
+        and best_id == "card_back"
+        and not MANUAL_SCAN_ALLOW_CARDBACK
+    ):
+        refresh_latest_matches_preserving(side, before_matches)
+        log_event(side, "manual", "manual_point_rejected_cardback", x=x, y=y, source=candidate.get("source"))
+        return None
+
+    track, _needs_processing = tracker.update_or_create_track(side=side, box=candidate["box"])
+    track["force_new_identification"] = True
+    track["last_decision"] = f"manual_point_scan source={candidate.get('source')}"
 
     previous_label = track.get("label")
     tracker.apply_recognition_result(track, best)
@@ -648,21 +1111,35 @@ def scan_point_for_card(frame, x, y, side, catalog):
         current_label
         and current_label not in ("unknown", "card_back")
         and current_score >= CONFIDENCE_THRESHOLD
-        and (
-            current_label != previous_label
-            or not track.get("displayed", False)
-        )
         and not track.get("queued", False)
     ):
         if OBS_QUEUE_ENABLED:
-            obs_queue.enqueue_match(
-                side=side,
-                card_id=current_label,
-                score=current_score,
-                track=track,
-            )
+            if MANUAL_POINT_FORCE_FRONT:
+                obs_queue.enqueue_front(
+                    side=side,
+                    card_id=current_label,
+                    score=current_score,
+                    track=track,
+                )
+            else:
+                obs_queue.enqueue_match(
+                    side=side,
+                    card_id=current_label,
+                    score=current_score,
+                    track=track,
+                )
         elif AUTO_SEND_TO_OBS:
             send_match_to_obs(side, current_label)
 
-    latest_matches[side] = tracker.get_visible_matches(side)
+    refresh_latest_matches_preserving(side, before_matches)
+    log_event(
+        side,
+        track.get("track_id"),
+        "manual_point_scan",
+        source=candidate.get("source"),
+        old=previous_label,
+        new=current_label,
+        score=f"{current_score:.2f}",
+    )
     return track
+
