@@ -101,16 +101,21 @@ from .config import (
     CARD_BACK_REFINE_BORDER_DIFF_THRESHOLD,
     CARD_BACK_USE_PROPOSAL_BOX,
     MANUAL_CHOICE_OPEN_FOR_IDENTIFIED,
+    CARD_MARGIN_OVERRIDES,
+    MANUAL_SCAN_BEST_OF_N_ENABLED,
+    MANUAL_SCAN_BEST_OF_N_FRAMES,
+    MANUAL_SCAN_BEST_OF_N_DELAY_SECONDS,
 )
 from .crop import crop_candidate
 from .detection import find_card_candidates
 from .obs_bridge import send_match_to_obs
-from .runtime_controls import auto_send_enabled
+from .obs_output import maybe_auto_queue
 from .tracking import CardTracker
 from .obs_queue import ObsFifoQueue
 from .corner_refine import dewarp_candidate_with_collectorvision
 from .perf import snapshot as perf_snapshot
 from .stability import log_event, log_human_event, recent_events
+from .diagnostics import save_candidate_diagnostics
 
 latest_matches = {"left": [], "right": []}
 
@@ -123,6 +128,7 @@ manual_choice_state = {
     "x": 28,
     "y": 92,
     "source": None,
+    "query": "",
 }
 
 tracker = CardTracker(
@@ -380,7 +386,73 @@ def card_back_result(refined, detail, signature, refined_card_back_box=None):
     }
 
 
-def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
+
+def card_margin_override_for(card_id):
+    card_id = str(card_id or "").lower()
+    for key, value in CARD_MARGIN_OVERRIDES.items():
+        if str(key).lower() in card_id:
+            return float(value)
+    return None
+
+
+def recognize_manual_best_of_n(frame_getter, candidate, side, candidate_index, catalog):
+    if frame_getter is None or not MANUAL_SCAN_BEST_OF_N_ENABLED:
+        return None
+
+    votes = {}
+    snapshots = []
+
+    for i in range(max(1, int(MANUAL_SCAN_BEST_OF_N_FRAMES))):
+        frame = frame_getter()
+        if frame is None:
+            continue
+
+        result = recognize_candidate_crop(
+            frame=frame,
+            candidate=candidate,
+            side=side,
+            candidate_index=candidate_index + i,
+            catalog=catalog,
+            force_diagnostics=(i == 0),
+        )
+
+        if result is None:
+            continue
+
+        snapshots.append(result)
+        card_id = result.get("id") or "unknown"
+        votes.setdefault(card_id, {"count": 0, "best": result, "score_sum": 0.0})
+        votes[card_id]["count"] += 1
+        votes[card_id]["score_sum"] += float(result.get("score", 0.0))
+
+        if float(result.get("score", 0.0)) > float(votes[card_id]["best"].get("score", 0.0)):
+            votes[card_id]["best"] = result
+
+        if MANUAL_SCAN_BEST_OF_N_DELAY_SECONDS > 0 and i < int(MANUAL_SCAN_BEST_OF_N_FRAMES) - 1:
+            import time as _time
+            _time.sleep(float(MANUAL_SCAN_BEST_OF_N_DELAY_SECONDS))
+
+    if not votes:
+        return None
+
+    ranked = sorted(
+        votes.items(),
+        key=lambda item: (
+            item[1]["count"],
+            item[1]["score_sum"] / max(1, item[1]["count"]),
+            float(item[1]["best"].get("score", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    best = dict(ranked[0][1]["best"])
+    best["best_of_n_count"] = ranked[0][1]["count"]
+    best["best_of_n_frames"] = len(snapshots)
+    best["refine_reason"] = f"{best.get('refine_reason', 'ok')};best_of_n={ranked[0][1]['count']}/{len(snapshots)}"
+    return best
+
+
+def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog, force_diagnostics=False):
     refined = get_candidate_pil_image(frame, candidate)
 
     if refined is None:
@@ -428,6 +500,17 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
     all_results.sort(key=lambda r: r["score"], reverse=True)
 
     if not all_results:
+        save_candidate_diagnostics(
+            frame=frame,
+            candidate=candidate,
+            side=side,
+            candidate_index=candidate_index,
+            refined=refined,
+            detail=detail,
+            results=[],
+            best=None,
+            forced=force_diagnostics,
+        )
         return None
 
     unique_alternatives = []
@@ -454,7 +537,11 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
         margin = best["score"] - second["score"]
         best["margin"] = margin
 
-        if best["score"] < AMBIGUOUS_MATCH_SCORE_THRESHOLD and margin < AMBIGUOUS_MATCH_MIN_MARGIN:
+        min_margin = card_margin_override_for(best.get("id"))
+        if min_margin is None:
+            min_margin = AMBIGUOUS_MATCH_MIN_MARGIN
+
+        if best["score"] < AMBIGUOUS_MATCH_SCORE_THRESHOLD and margin < min_margin:
             if looks_like_card_back(detail):
                 best["id"] = "card_back"
                 best["score"] = 1.0
@@ -464,6 +551,18 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
                 best["refine_reason"] = f"ambiguous_margin:{margin:.3f}"
     else:
         best["margin"] = None
+
+    save_candidate_diagnostics(
+        frame=frame,
+        candidate=candidate,
+        side=side,
+        candidate_index=candidate_index,
+        refined=refined,
+        detail=detail,
+        results=all_results,
+        best=best,
+        forced=force_diagnostics,
+    )
 
     return best
 
@@ -883,6 +982,7 @@ def open_manual_choices_for_track(side, track_id, title=None):
         manual_choice_state["choices"] = choices
         manual_choice_state["title"] = title or MANUAL_CHOICE_TITLE
         manual_choice_state["source"] = "right_click"
+        manual_choice_state["query"] = ""
 
         box = track.get("box")
         if box is not None:
@@ -987,6 +1087,57 @@ def apply_manual_choice(choice_index):
 def close_manual_choices():
     manual_choice_state["active"] = False
     return True
+
+
+def manual_selector_set_query(query, catalog):
+    if not manual_choice_state.get("active"):
+        return False
+
+    if not MANUAL_SELECTOR_TEXT_SEARCH_ENABLED:
+        return False
+
+    query = str(query or "").strip()
+    manual_choice_state["query"] = query
+
+    if not query:
+        return False
+
+    choices = catalog.search_text(query, limit=MANUAL_SELECTOR_SEARCH_MAX_RESULTS)
+
+    if not choices:
+        return False
+
+    manual_choice_state["choices"] = choices
+    log_event(
+        manual_choice_state.get("side"),
+        manual_choice_state.get("track_id"),
+        "manual_selector_text_search",
+        query=query,
+        choices="|".join(f"{c.get('id')}:{c.get('score', 0.0):.2f}" for c in choices),
+    )
+    return True
+
+
+def manual_selector_backspace():
+    if not manual_choice_state.get("active"):
+        return False
+    manual_choice_state["query"] = str(manual_choice_state.get("query", ""))[:-1]
+    return True
+
+
+def manual_selector_append_char(char, catalog):
+    if not manual_choice_state.get("active"):
+        return False
+
+    if len(char) != 1:
+        return False
+
+    if not (char.isalnum() or char in (" ", "_", "-", ":", "'", '"')):
+        return False
+
+    query = str(manual_choice_state.get("query", "")) + char
+    return manual_selector_set_query(query, catalog)
+
 
 
 
@@ -1284,6 +1435,7 @@ def scan_side_for_matches(frame, roi, side, catalog):
         visual_refresh_same_label = (
             bool(track.get("raw_visual_change_pending", False))
             and current_label == previous_label
+            and not VISUAL_RECHECK_FORCE_REQUEUE_SAME_LABEL
         )
 
         if (
@@ -1297,16 +1449,13 @@ def scan_side_for_matches(frame, roi, side, catalog):
             )
             and not track.get("queued", False)
         ):
-            if auto_send_enabled():
-                if OBS_QUEUE_ENABLED:
-                    obs_queue.enqueue_match(
-                        side=side,
-                        card_id=current_label,
-                        score=current_score,
-                        track=track,
-                    )
-                elif AUTO_SEND_TO_OBS:
-                    send_match_to_obs(side, current_label)
+            maybe_auto_queue(
+                obs_queue=obs_queue,
+                side=side,
+                card_id=current_label,
+                score=current_score,
+                track=track,
+            )
 
     if LOG_SCAN_SUMMARIES or DEBUG_VERBOSE_STABILITY_LOGS:
         log_event(
@@ -1485,7 +1634,7 @@ def manual_candidate_from_rect(x1, y1, x2, y2):
     }
 
 
-def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog):
+def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog, frame_getter=None):
     before_matches = list(latest_matches.get(side, []))
 
     search_x1, search_y1, search_x2, search_y2 = x1, y1, x2, y2
@@ -1514,11 +1663,13 @@ def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog):
     track, _needs_processing = tracker.update_or_create_track(side=side, box=candidate["box"])
     track["force_new_identification"] = True
     track["last_decision"] = f"manual_box_scan source={candidate.get('source')}"
-    best = recognize_candidate_crop(frame, candidate, side, 998, catalog)
+    best = recognize_manual_best_of_n(frame_getter, candidate, side, 998, catalog)
+    if best is None:
+        best = recognize_candidate_crop(frame, candidate, side, 998, catalog, force_diagnostics=True)
 
     if best is None and MANUAL_SCAN_RELAX_THRESHOLDS:
         candidate["source"] = "manual_drag_relaxed"
-        best = recognize_candidate_crop(frame, candidate, side, 999, catalog)
+        best = recognize_candidate_crop(frame, candidate, side, 999, catalog, force_diagnostics=True)
 
     previous_label = track.get("label")
 
@@ -1578,7 +1729,7 @@ def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog):
     return track
 
 
-def scan_point_for_card(frame, x, y, side, catalog):
+def scan_point_for_card(frame, x, y, side, catalog, frame_getter=None):
     from .roi import rois
     import cv2 as _cv2
 
@@ -1617,7 +1768,9 @@ def scan_point_for_card(frame, x, y, side, catalog):
 
     # Recognize first. If this explicit click still produces no useful answer,
     # preserve the existing overlays and do not create a temporary unknown box.
-    best = recognize_candidate_crop(frame, candidate, side, 999, catalog)
+    best = recognize_manual_best_of_n(frame_getter, candidate, side, 999, catalog)
+    if best is None:
+        best = recognize_candidate_crop(frame, candidate, side, 999, catalog, force_diagnostics=True)
 
     if best is None:
         refresh_latest_matches_preserving(side, before_matches)

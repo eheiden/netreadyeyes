@@ -9,6 +9,7 @@ from .config import (
     CONTROL_QUEUE_SECONDS_DEFAULT,
     CONTROL_QUEUE_SECONDS_MIN,
     CONTROL_QUEUE_SECONDS_MAX,
+    CONTROL_GPU_ENABLED_DEFAULT,
 )
 
 
@@ -16,6 +17,7 @@ _state = {
     "mode": CONTROL_MODE_DEFAULT,
     "manual_click_respect_queue": bool(CONTROL_MANUAL_CLICK_RESPECT_QUEUE_DEFAULT),
     "queue_wait_seconds": float(CONTROL_QUEUE_SECONDS_DEFAULT),
+    "gpu_enabled": bool(CONTROL_GPU_ENABLED_DEFAULT),
 }
 
 _dirty = False
@@ -53,6 +55,7 @@ def load_settings():
         "queue_wait_seconds",
         _state["queue_wait_seconds"],
     ))
+    _state["gpu_enabled"] = bool(data.get("gpu_enabled", _state["gpu_enabled"]))
     _dirty = False
     return dict(_state)
 
@@ -122,6 +125,21 @@ def set_queue_wait_seconds(value):
     return True
 
 
+def gpu_enabled():
+    return bool(_state.get("gpu_enabled", True))
+
+
+def set_gpu_enabled(value):
+    global _dirty
+
+    value = bool(value)
+    if bool(_state.get("gpu_enabled", True)) != value:
+        _state["gpu_enabled"] = value
+        _dirty = True
+
+    return True
+
+
 def is_dirty():
     return _dirty
 
@@ -146,17 +164,21 @@ def handle_control_click(x, y, controls):
             return set_manual_click_respect_queue(True)
         if name == "click_instant":
             return set_manual_click_respect_queue(False)
+        if name == "gpu_on":
+            return set_gpu_enabled(True)
+        if name == "gpu_off":
+            return set_gpu_enabled(False)
         if name == "save":
             save_settings()
             return True
 
-    slider = controls.get("slider")
-    if slider:
-        sx, sy, sw, sh = slider
-        if sx <= x <= sx + sw and sy - 10 <= y <= sy + sh + 10:
-            frac = (x - sx) / max(1, sw)
-            seconds = CONTROL_QUEUE_SECONDS_MIN + frac * (CONTROL_QUEUE_SECONDS_MAX - CONTROL_QUEUE_SECONDS_MIN)
-            return set_queue_wait_seconds(seconds)
+    for name, delta in (("wait_minus", -1.0), ("wait_plus", 1.0)):
+        rect = buttons.get(name)
+        if not rect:
+            continue
+        rx, ry, rw, rh = rect
+        if rx <= x <= rx + rw and ry <= y <= ry + rh:
+            return set_queue_wait_seconds(_state["queue_wait_seconds"] + delta)
 
     return False
 

@@ -4,6 +4,8 @@ import threading
 import time
 from collections import deque
 
+from .gpu_status import get_gpu_status
+
 from .config import (
     PERF_HISTORY_SIZE,
     PER_THREAD_CPU_MONITOR_ENABLED,
@@ -191,4 +193,6 @@ def snapshot():
         "process_cpu_percent": process_cpu,
         "thread_cpu": thread_cpu,
         "psutil_available": psutil is not None,
+        "cpu_note": "Percent is measured per logical CPU core; multicore process CPU can exceed 100%. native-* rows are non-Python/native library threads.",
+        "gpu": get_gpu_status(),
     }

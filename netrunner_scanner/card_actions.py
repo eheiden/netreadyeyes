@@ -2,7 +2,7 @@ import time
 
 import cv2
 
-from .recognition import latest_matches, tracker, obs_queue, scan_point_for_card, scan_box_for_card, manual_choice_state, apply_manual_choice, close_manual_choices, open_manual_choices_for_track
+from .recognition import latest_matches, tracker, obs_queue, scan_point_for_card, scan_box_for_card, manual_choice_state, apply_manual_choice, close_manual_choices, open_manual_choices_for_track, manual_selector_append_char, manual_selector_backspace, manual_selector_set_query
 from .roi import rois, point_in_roi, on_mouse as roi_on_mouse
 from .display_utils import display_to_source
 from .runtime_controls import manual_click_respects_queue, handle_control_click
@@ -180,9 +180,14 @@ def draw_manual_choice_overlay(frame):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 255), 1)
 
     title = manual_choice_state.get("title") or MANUAL_CHOICE_TITLE
+    query = str(manual_choice_state.get("query", ""))
+    if query:
+        title = f"{title}: {query[-28:]}"
+    else:
+        title = f"{title} (type to search)"
     cv2.putText(
         frame,
-        title,
+        title[:58],
         (x + 12, y + 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.60,
@@ -330,7 +335,7 @@ def run_menu_action(action):
         return True
 
     if action == "selector":
-        open_manual_choices_for_track(side, track_id)
+        open_manual_choices_for_track, manual_selector_append_char, manual_selector_backspace, manual_selector_set_query(side, track_id)
         menu_state["active"] = False
         return True
 
@@ -399,8 +404,14 @@ def handle_card_menu_key(key):
     if manual_choice_state.get("active"):
         if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
             return apply_manual_choice(key - ord("1"))
+        if key == 8:
+            return manual_selector_backspace()
+        if key in (13, 10):
+            return manual_selector_set_query(manual_choice_state.get("query", ""), runtime.get("catalog"))
         if key == 27:
             return close_manual_choices()
+        if 32 <= key <= 126:
+            return manual_selector_append_char(chr(key), runtime.get("catalog"))
 
     if not menu_state["active"]:
         return False

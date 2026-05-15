@@ -33,6 +33,8 @@ from netrunner_scanner.card_actions import make_mouse_handler, draw_card_menu, d
 from netrunner_scanner.scanner_worker import ScannerWorker
 from netrunner_scanner.perf import now as perf_now, record as perf_record, start_thread_cpu_monitor
 from netrunner_scanner.console_utils import print_error
+from netrunner_scanner.runtime_controls import load_settings, gpu_enabled
+from netrunner_scanner.gpu_status import configure_gpu
 
 
 def main():
@@ -40,6 +42,9 @@ def main():
         cv2.setNumThreads(OPENCV_NUM_THREADS)
     except cv2.error:
         pass
+
+    load_settings()
+    configure_gpu(gpu_enabled())
 
     start_thread_cpu_monitor()
 

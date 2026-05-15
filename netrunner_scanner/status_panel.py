@@ -115,6 +115,19 @@ def draw_perf(panel, status, y):
         draw_text(panel, val, 140, y, scale=0.40, color=(210, 210, 210))
         y += 17
 
+    gpu = perf.get("gpu", {})
+    if gpu:
+        provider = trim_id(gpu.get("active", "unknown"), 26)
+        enabled = "on" if gpu.get("gpu_enabled") else "off"
+        draw_text(panel, "GPU", 16, y, scale=0.40, color=(180, 180, 180))
+        draw_text(panel, f"{enabled} / {provider}", 80, y, scale=0.36, color=(210, 210, 210))
+        y += 17
+        bench = gpu.get("last_benchmark_ms")
+        if bench is not None:
+            draw_text(panel, "bench", 16, y, scale=0.36, color=(160, 160, 160))
+            draw_text(panel, f"{float(bench):.1f} ms/img", 80, y, scale=0.36, color=(190, 190, 190))
+            y += 15
+
     threads = perf.get("thread_cpu", [])
     if threads:
         draw_text(panel, "top threads", 16, y, scale=0.40, color=(210, 210, 210))
@@ -331,6 +344,7 @@ def draw_controls(panel, y):
     mode = settings.get("mode", "automatic")
     respect_queue = bool(settings.get("manual_click_respect_queue", False))
     wait = float(settings.get("queue_wait_seconds", 8.0))
+    gpu_on = bool(settings.get("gpu_enabled", True))
 
     buttons = {}
 
@@ -350,32 +364,38 @@ def draw_controls(panel, y):
     buttons["click_queue"] = (160, y - 20, 132, 26)
     draw_radio(panel, "Instant", 20, y, not respect_queue)
     draw_radio(panel, "Use queue", 162, y, respect_queue)
-    y += 36
+    y += 34
 
-    draw_text(panel, f"Queue wait: {wait:.1f}s", 16, y, scale=0.42, color=(220, 220, 220))
+    draw_text(panel, "Queue wait seconds", 16, y, scale=0.40, color=(170, 170, 170))
     y += 24
 
-    slider_x = 22
-    slider_y = y
-    slider_w = panel.shape[1] - 58
-    slider_h = 8
-    cv2.line(panel, (slider_x, slider_y + 4), (slider_x + slider_w, slider_y + 4), (105, 105, 112), 2, cv2.LINE_AA)
-    frac = (wait - float(CONTROL_QUEUE_SECONDS_MIN)) / max(0.001, float(CONTROL_QUEUE_SECONDS_MAX) - float(CONTROL_QUEUE_SECONDS_MIN))
-    frac = max(0.0, min(1.0, frac))
-    knob_x = int(slider_x + frac * slider_w)
-    cv2.circle(panel, (knob_x, slider_y + 4), 8, (0, 220, 255), -1, cv2.LINE_AA)
-    draw_text(panel, f"{CONTROL_QUEUE_SECONDS_MIN:.0f}", slider_x, slider_y + 25, scale=0.34, color=(130, 130, 130))
-    draw_text(panel, f"{CONTROL_QUEUE_SECONDS_MAX:.0f}", slider_x + slider_w - 14, slider_y + 25, scale=0.34, color=(130, 130, 130))
-    y += 48
+    buttons["wait_minus"] = (18, y - 21, 30, 26)
+    buttons["wait_plus"] = (130, y - 21, 30, 26)
 
-    save_label = "Save settings" + (" *" if is_dirty() else "")
-    buttons["save"] = (18, y - 20, panel.shape[1] - 36, 28)
+    draw_button_panel(panel, "-", buttons["wait_minus"], active=False)
+    cv2.rectangle(panel, (56, y - 21), (122, y + 5), (30, 30, 34), -1)
+    cv2.rectangle(panel, (56, y - 21), (122, y + 5), (90, 90, 98), 1)
+    draw_text(panel, f"{wait:.1f}", 72, y, scale=0.45, color=(235, 235, 235))
+    draw_button_panel(panel, "+", buttons["wait_plus"], active=False)
+    draw_text(panel, f"range {CONTROL_QUEUE_SECONDS_MIN:.0f}-{CONTROL_QUEUE_SECONDS_MAX:.0f}", 176, y, scale=0.36, color=(135, 135, 135))
+    y += 38
+
+    draw_text(panel, "GPU acceleration", 16, y, scale=0.40, color=(170, 170, 170))
+    y += 23
+
+    buttons["gpu_on"] = (18, y - 20, 132, 26)
+    buttons["gpu_off"] = (160, y - 20, 132, 26)
+    draw_radio(panel, "On", 20, y, gpu_on)
+    draw_radio(panel, "Off", 162, y, not gpu_on)
+    y += 34
+
+    save_label = "Save" + (" *" if is_dirty() else "")
+    buttons["save"] = (18, y - 20, 120, 28)
     draw_button_panel(panel, save_label, buttons["save"], active=is_dirty())
     y += 42
 
     controls = {
         "buttons": buttons,
-        "slider": (slider_x, slider_y - 8, slider_w, slider_h + 16),
     }
 
     return y + 8, controls

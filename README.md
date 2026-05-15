@@ -1,12 +1,12 @@
-# Net Ready Eyes v0.4
+# Net Ready Eyes v0.9
 
 Net Ready Eyes is a webcam-based Netrunner card recognition tool for livestream overlays and OBS workflows.
 
 ## Current version
 
 - Major: `0`
-- Minor: `4`
-- Version: `0.4`
+- Minor: `9`
+- Version: `0.9`
 
 Version numbers live in `netrunner_scanner/config.py` and `netrunner_scanner/version.py`.
 
@@ -52,7 +52,7 @@ Then run:
 .\.venv\Scripts\python.exe .\netreadyeyes.py
 ```
 
-`live_scanner.py` is kept as a small compatibility wrapper, but `netreadyeyes.py` is the main entry point.
+`netreadyeyes.py` is the app entry point.
 
 ## Manual setup
 
@@ -126,5 +126,65 @@ The right sidebar includes a Controls panel.
 - **Left-click OBS send**:
   - **Instant** sends a clicked card to OBS immediately.
   - **Use queue** puts a clicked card at the front of its side queue and respects the queue wait timer.
-- **Queue wait** slider: 4 to 10 seconds.
+- **Queue wait** value control: 1 to 15 seconds; default is 5 seconds for new settings files.
 - **Save settings** writes your choices to `netreadyeyes_settings.json`; they load automatically next time.
+
+## GPU acceleration
+
+The Controls panel includes a GPU On/Off setting and the Performance section shows the active ONNX provider when detectable.
+
+Important: CollectorVision owns some model/session internals. Net Ready Eyes can show whether CUDA/TensorRT/DirectML providers are available and records the GPU preference before models are loaded, but if a provider change does not take effect immediately, restart the app after saving the setting.
+
+## Manual selector text search
+
+When the Manual card selector is open, type part of a card name. The selector will replace the image-recognition suggestions with the closest catalogue matches. Use Backspace to edit and `1`-`5` or click to choose a result.
+
+## Measuring GPU impact
+
+The live UI shows which ONNX provider is available/active, but the best way to compare GPU/CPU is to benchmark the same images both ways:
+
+```powershell
+.\.venv\Scripts\python.exe .\benchmark_gpu.py
+```
+
+By default, the benchmark:
+- searches the configured card image folders from `CARD_IMAGE_DIRS`
+- tests every catalogue card image it can find
+- runs GPU ON and GPU OFF automatically
+- prints timing results
+- writes `benchmark_report.txt`
+- lists the most ambiguous / difficult cards by incorrect result or low match margin
+
+Useful options:
+
+```powershell
+.\.venv\Scripts\python.exe .\benchmark_gpu.py --limit 100
+.\.venv\Scripts\python.exe .\benchmark_gpu.py --report my_report.txt
+.\.venv\Scripts\python.exe .\benchmark_gpu.py --image-dirs public/cards cards downloaded_cards alt_arts
+```
+
+If GPU and CPU numbers are almost identical, CollectorVision or ONNX Runtime may still be using CPU internally, the model may be too small for GPU to help, or image preprocessing may dominate the runtime.
+
+### Ambiguity report filtering
+
+The benchmark report now excludes same-name printing conflicts from the difficult-card list by default. For example, `hedge_fund_20132` vs `hedge_fund_25146` is treated as the same practical card name, not a gameplay-relevant misrecognition.
+
+To include those printing-level conflicts anyway:
+
+```powershell
+.\.venv\Scripts\python.exe .\benchmark_gpu.py --include-same-name-printings
+```
+
+### CPU-load comparison
+
+`benchmark_gpu.py` now reports CPU load for GPU ON and OFF runs.
+
+- `ms/image` is the average catalogue matching time for one card image.
+- `core-equiv CPU %` is CPU usage measured as one core = 100%; this can exceed 100% on multicore systems.
+- `whole-machine CPU %` divides that by your logical CPU count, which is closer to overall Task Manager-style headroom.
+
+Install `psutil` for CPU-load measurements:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install psutil
+```

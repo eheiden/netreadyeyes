@@ -12,6 +12,7 @@ from .config import (
     CORNER_REFINER_MIN_ASPECT,
     CORNER_REFINER_MAX_ASPECT,
     CORNER_REFINER_FALLBACK_TO_OPENCV,
+    MANUAL_SCAN_BYPASS_GEOMETRY_REJECTION,
 )
 
 _detector = None
@@ -185,7 +186,9 @@ def dewarp_candidate_with_collectorvision(frame, candidate):
     valid, reason = validate_refined_box(candidate, refined_box)
 
     if not valid:
-        return fallback_result(reason, sharpness, confidence)
+        manual_source = str(candidate.get("source", "")).startswith("manual")
+        if not (MANUAL_SCAN_BYPASS_GEOMETRY_REJECTION and manual_source and refined_box is not None):
+            return fallback_result(reason, sharpness, confidence)
 
     try:
         dewarped = detection.dewarp(crop)
