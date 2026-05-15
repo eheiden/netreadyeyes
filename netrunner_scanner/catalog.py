@@ -10,7 +10,7 @@ class CardCatalog:
         base_catalog = cvg.Catalog.load("hf://HanClinto/milo/scryfall-mtg")
         self.embedder = base_catalog.embedder
 
-        print("Loading Netrunner catalog...")
+        print("Loading Net Ready Eyes catalog...")
         data = np.load(catalog_path, allow_pickle=True)
 
         self.ids = data["ids"]

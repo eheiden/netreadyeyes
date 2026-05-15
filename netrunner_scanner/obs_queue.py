@@ -8,6 +8,7 @@ from .config import (
     CONFIDENCE_THRESHOLD,
 )
 from .obs_bridge import send_match_to_obs
+from .runtime_controls import get_queue_wait_seconds
 
 
 class ObsFifoQueue:
@@ -89,11 +90,47 @@ class ObsFifoQueue:
             track["queued"] = True
             track["displayed"] = False
 
+
+    def send_immediate(self, side, card_id, score, track=None):
+        if score < CONFIDENCE_THRESHOLD:
+            return
+
+        side = side if side in self.queues else "left"
+        key = self._key(side, card_id)
+
+        # Remove queued duplicates before sending immediately.
+        self.queues[side] = type(self.queues[side])(
+            item for item in self.queues[side]
+            if self._key(side, item["card_id"]) != key
+        )
+        self.queued_keys.discard(key)
+
+        send_match_to_obs(side=side, card_id=card_id)
+
+        now = time.time()
+        self.last_pop_time[side] = now
+
+        if track is not None:
+            track["displayed"] = True
+            track["queued"] = False
+
+        sent_item = {
+            "side": side,
+            "card_id": card_id,
+            "score": float(score),
+            "sent_at": now,
+        }
+        self.last_sent[side] = sent_item
+        self.sent_history.insert(0, sent_item)
+        self.sent_history = self.sent_history[:20]
+
     def _tick_side(self, side, now):
         queue = self.queues[side]
 
         if not queue:
             return
+
+        self.pop_interval_seconds = get_queue_wait_seconds()
 
         if now - self.last_pop_time[side] < self.pop_interval_seconds:
             return
@@ -144,6 +181,8 @@ class ObsFifoQueue:
 
         for side in ["left", "right"]:
             queue = self.queues[side]
+            self.pop_interval_seconds = get_queue_wait_seconds()
+
             if queue:
                 next_send_in[side] = max(
                     0.0,

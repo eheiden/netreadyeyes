@@ -190,6 +190,12 @@ class CardTracker:
                 "last_raw_visual_diff": None,
                 "last_raw_visual_diff_at": 0.0,
                 "raw_visual_change_pending": False,
+                "raw_visual_change_count": 0,
+                "raw_visual_change_started_at": 0.0,
+                "pending_replacement_label": None,
+                "pending_replacement_count": 0,
+                "pending_replacement_started_at": 0.0,
+                "last_alternatives": [],
                 "forced_visual_change_at": 0.0,
             }
             self.next_track_id += 1
@@ -398,6 +404,9 @@ class CardTracker:
                 "last_signature_distance": track.get("last_signature_distance"),
                 "last_raw_visual_diff": track.get("last_raw_visual_diff"),
                 "raw_visual_change_pending": track.get("raw_visual_change_pending", False),
+                "raw_visual_change_count": track.get("raw_visual_change_count", 0),
+                "pending_replacement_label": track.get("pending_replacement_label"),
+                "pending_replacement_count": track.get("pending_replacement_count", 0),
                 "forced_visual_change_at": track.get("forced_visual_change_at", 0.0),
             })
 

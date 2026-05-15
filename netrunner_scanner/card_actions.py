@@ -2,10 +2,11 @@ import time
 
 import cv2
 
-from .recognition import latest_matches, tracker, obs_queue, scan_point_for_card, scan_box_for_card
+from .recognition import latest_matches, tracker, obs_queue, scan_point_for_card, scan_box_for_card, manual_choice_state, apply_manual_choice, close_manual_choices, open_manual_choices_for_track
 from .roi import rois, point_in_roi, on_mouse as roi_on_mouse
 from .display_utils import display_to_source
-from .config import GUI_DISPLAY_SCALE, LEFT_CLICK_FORCE_OBS, RIGHT_CLICK_CARD_MENU, MANUAL_DRAG_SCAN_ENABLED, MANUAL_DRAG_MIN_WIDTH_PX, MANUAL_DRAG_MIN_HEIGHT_PX, MANUAL_DRAG_PROCESS_SYNC, MANUAL_POINT_SCAN_ON_CLICK
+from .runtime_controls import manual_click_respects_queue, handle_control_click
+from .config import GUI_DISPLAY_SCALE, LEFT_CLICK_FORCE_OBS, RIGHT_CLICK_CARD_MENU, MANUAL_DRAG_SCAN_ENABLED, MANUAL_DRAG_MIN_WIDTH_PX, MANUAL_DRAG_MIN_HEIGHT_PX, MANUAL_DRAG_PROCESS_SYNC, MANUAL_POINT_SCAN_ON_CLICK, RIGHT_CLICK_CLEAR_DELETES_TRACK, MANUAL_CHOICE_WIDTH, MANUAL_CHOICE_ROW_HEIGHT, MANUAL_CHOICE_MARGIN, MANUAL_CHOICE_TITLE
 
 menu_state = {
     "active": False,
@@ -23,6 +24,7 @@ menu_state = {
     "pending_click_scan": False,
     "pending_click_start": None,
     "pending_click_side": None,
+    "choice_buttons": {},
 }
 
 runtime = {
@@ -31,7 +33,33 @@ runtime = {
     "frame_size_getter": None,
     "point_submitter": None,
     "box_submitter": None,
+    "status_controls_getter": None,
 }
+
+
+def handle_status_panel_click(x, y):
+    scaled_x, scaled_y = display_to_source(x, y)
+
+    frame_size_getter = runtime.get("frame_size_getter")
+    controls_getter = runtime.get("status_controls_getter")
+
+    if frame_size_getter is None or controls_getter is None:
+        return False
+
+    frame_width, _frame_height = frame_size_getter()
+    scale = float(GUI_DISPLAY_SCALE)
+    if scale <= 0:
+        scale = 1.0
+
+    scaled_frame_w = int(frame_width * scale)
+
+    if scaled_x < scaled_frame_w:
+        return False
+
+    sidebar_x = int(scaled_x - scaled_frame_w)
+    sidebar_y = int(scaled_y)
+
+    return handle_control_click(sidebar_x, sidebar_y, controls_getter())
 
 
 def display_click_to_frame_coords(x, y):
@@ -119,6 +147,102 @@ def draw_manual_drag_box(frame):
             cv2.LINE_AA,
         )
 
+def draw_manual_choice_overlay(frame):
+    if not manual_choice_state.get("active"):
+        menu_state["choice_buttons"] = {}
+        return
+
+    choices = manual_choice_state.get("choices") or []
+    if not choices:
+        menu_state["choice_buttons"] = {}
+        return
+
+    frame_h, frame_w = frame.shape[:2]
+    w = int(MANUAL_CHOICE_WIDTH)
+    row_h = int(MANUAL_CHOICE_ROW_HEIGHT)
+    margin = int(MANUAL_CHOICE_MARGIN)
+    title_h = 38
+    cancel_h = 34
+    h = title_h + row_h * len(choices) + cancel_h + margin * 2
+
+    x = int(manual_choice_state.get("x", 28))
+    y = int(manual_choice_state.get("y", 92))
+
+    # Keep the selector near the card, but clamp it into the visible camera frame.
+    if x + w > frame_w - margin:
+        x = max(margin, frame_w - w - margin)
+    if y + h > frame_h - margin:
+        y = max(margin, frame_h - h - margin)
+    x = max(margin, x)
+    y = max(margin, y)
+
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (24, 24, 28), -1)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 255), 1)
+
+    title = manual_choice_state.get("title") or MANUAL_CHOICE_TITLE
+    cv2.putText(
+        frame,
+        title,
+        (x + 12, y + 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.60,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    buttons = {}
+
+    for i, choice in enumerate(choices):
+        by = y + title_h + i * row_h
+        rect = (x + 10, by, w - 20, row_h - 6)
+        buttons[str(i)] = rect
+        card_id = str(choice.get("id", "unknown"))
+        score = float(choice.get("score", 0.0))
+        label = f"{i + 1}. {card_id}   {score:.2f}"
+
+        cv2.rectangle(frame, (rect[0], rect[1]), (rect[0] + rect[2], rect[1] + rect[3]), (44, 44, 50), -1)
+        cv2.rectangle(frame, (rect[0], rect[1]), (rect[0] + rect[2], rect[1] + rect[3]), (90, 90, 98), 1)
+        cv2.putText(
+            frame,
+            label[:58],
+            (rect[0] + 8, rect[1] + 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cancel_y = y + title_h + row_h * len(choices) + 6
+    cancel_rect = (x + 10, cancel_y, 120, 26)
+    buttons["cancel"] = cancel_rect
+    cv2.rectangle(frame, (cancel_rect[0], cancel_rect[1]), (cancel_rect[0] + cancel_rect[2], cancel_rect[1] + cancel_rect[3]), (50, 36, 36), -1)
+    cv2.rectangle(frame, (cancel_rect[0], cancel_rect[1]), (cancel_rect[0] + cancel_rect[2], cancel_rect[1] + cancel_rect[3]), (120, 90, 90), 1)
+    cv2.putText(frame, "Cancel", (cancel_rect[0] + 10, cancel_rect[1] + 19), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 235, 235), 1, cv2.LINE_AA)
+
+    menu_state["choice_buttons"] = buttons
+
+
+def handle_manual_choice_click(x, y):
+    if not manual_choice_state.get("active"):
+        return False
+
+    for key, rect in menu_state.get("choice_buttons", {}).items():
+        if not point_in_rect(x, y, rect):
+            continue
+
+        if key == "cancel":
+            close_manual_choices()
+            return True
+
+        try:
+            return apply_manual_choice(int(key))
+        except ValueError:
+            return False
+
+    return False
+
 
 def find_clicked_match(x, y):
     for side in ["left", "right"]:
@@ -140,7 +264,16 @@ def side_for_point(x, y):
 
 
 def clear_track_identification(side, track_id):
-    for track in tracker.tracks.get(side, []):
+    tracks = tracker.tracks.get(side, [])
+
+    if RIGHT_CLICK_CLEAR_DELETES_TRACK:
+        before = len(tracks)
+        tracker.tracks[side] = [track for track in tracks if track.get("track_id") != track_id]
+        latest_matches[side] = [match for match in latest_matches.get(side, []) if match.get("track_id") != track_id]
+        print(f"Deleted {side} track {track_id}")
+        return len(tracker.tracks[side]) != before
+
+    for track in tracks:
         if track.get("track_id") == track_id:
             track["label"] = "unknown"
             track["score"] = 0.0
@@ -149,6 +282,7 @@ def clear_track_identification(side, track_id):
             track["queued"] = False
             track["last_processed_at"] = 0.0
             track["visual_signature"] = None
+            track["last_raw_signature"] = None
             print(f"Cleared identification for {side} track {track_id}")
             return True
 
@@ -195,6 +329,11 @@ def run_menu_action(action):
         menu_state["active"] = False
         return True
 
+    if action == "selector":
+        open_manual_choices_for_track(side, track_id)
+        menu_state["active"] = False
+        return True
+
     return False
 
 
@@ -229,8 +368,8 @@ def draw_card_menu(frame):
     x = int(menu_state["x"])
     y = int(menu_state["y"])
 
-    w = 330
-    h = 130
+    w = 360
+    h = 174
 
     frame_h, frame_w = frame.shape[:2]
     x = min(x, frame_w - w - 4)
@@ -241,8 +380,9 @@ def draw_card_menu(frame):
     menu_state["x"] = x
     menu_state["y"] = y
     menu_state["buttons"] = {
-        "clear": (x + 14, y + 40, w - 28, 34),
+        "selector": (x + 14, y + 40, w - 28, 34),
         "force": (x + 14, y + 82, w - 28, 34),
+        "clear": (x + 14, y + 124, w - 28, 34),
     }
 
     cv2.rectangle(frame, (x, y), (x + w, y + h), (25, 25, 25), -1)
@@ -250,11 +390,18 @@ def draw_card_menu(frame):
 
     cv2.putText(frame, "Card actions", (x + 14, y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
 
-    draw_button(frame, "clear", "Clear ID + refresh", menu_state["buttons"]["clear"])
+    draw_button(frame, "selector", "Open manual card selector", menu_state["buttons"]["selector"])
     draw_button(frame, "force", "Force to front of OBS queue", menu_state["buttons"]["force"])
+    draw_button(frame, "clear", "Delete track + rescan", menu_state["buttons"]["clear"])
 
 
 def handle_card_menu_key(key):
+    if manual_choice_state.get("active"):
+        if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+            return apply_manual_choice(key - ord("1"))
+        if key == 27:
+            return close_manual_choices()
+
     if not menu_state["active"]:
         return False
 
@@ -263,6 +410,9 @@ def handle_card_menu_key(key):
 
     if key in (ord("f"), ord("F")):
         return run_menu_action("force")
+
+    if key in (ord("m"), ord("M")):
+        return run_menu_action("selector")
 
     if key == 27:
         menu_state["active"] = False
@@ -297,17 +447,20 @@ def scan_unrecognized_spot(x, y):
     return True
 
 
-def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point_submitter=None, box_submitter=None):
+def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point_submitter=None, box_submitter=None, status_controls_getter=None):
     runtime["frame_size_getter"] = frame_size_getter
     runtime["frame_getter"] = frame_getter
     runtime["catalog"] = catalog
     runtime["point_submitter"] = point_submitter
     runtime["box_submitter"] = box_submitter
+    runtime["status_controls_getter"] = status_controls_getter
 
     def on_mouse(event, x, y, flags, param):
         mapped = display_click_to_frame_coords(x, y)
 
         if mapped is None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                handle_status_panel_click(x, y)
             return
 
         source_x, source_y = mapped
@@ -346,6 +499,9 @@ def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point
                 return
 
         if event == cv2.EVENT_LBUTTONDOWN:
+            if handle_manual_choice_click(source_x, source_y):
+                return
+
             if menu_state["active"]:
                 update_hover(source_x, source_y)
                 hover = menu_state.get("hover")

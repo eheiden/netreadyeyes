@@ -1,0 +1,7 @@
+opencv-python
+pillow
+numpy
+requests
+pandas
+onnxruntime
+collector-vision

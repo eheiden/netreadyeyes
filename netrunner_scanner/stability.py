@@ -8,6 +8,7 @@ from .config import (
     STABILITY_DEBUG_ENABLED,
     STABILITY_EVENT_LOG_FILE,
     STABILITY_EVENT_LOG_MAX_LINES,
+    DEBUG_VERBOSE_STABILITY_LOGS,
 )
 
 _recent_events = []
@@ -15,6 +16,18 @@ _recent_events = []
 
 def log_event(side, track_id, event, **fields):
     if not STABILITY_DEBUG_ENABLED:
+        return
+
+    noisy_events = {
+        "visual_recheck",
+        "raw_visual_same",
+        "same_spot_reuse",
+        "same_spot_borderline",
+        "human_scan_summary",
+        "scan_summary",
+    }
+
+    if event in noisy_events and not DEBUG_VERBOSE_STABILITY_LOGS:
         return
 
     parts = [
@@ -52,6 +65,9 @@ def log_human_event(side, track_id, event, **fields):
     side_text = str(side).upper()
     label = pretty_card_id(fields.get("label") or fields.get("new") or fields.get("old"))
     reason = explain_reason(fields.get("reason") or fields.get("best_reason"))
+
+    if event == "scan_summary" and not DEBUG_VERBOSE_STABILITY_LOGS:
+        return
 
     if event == "label_change":
         old_label = pretty_card_id(fields.get("old"))

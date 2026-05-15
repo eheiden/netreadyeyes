@@ -73,10 +73,39 @@ from .config import (
     MANUAL_POINT_FORCE_FRONT,
     MANUAL_POINT_EXPAND_SEARCH_PX,
     MANUAL_POINT_MIN_CANDIDATE_AREA,
+    DEBUG_VERBOSE_STABILITY_LOGS,
+    LOG_SCAN_SUMMARIES,
+    LOG_VISUAL_SAME_CHECKS,
+    LAST_KNOWN_REACQUIRE_ENABLED,
+    LAST_KNOWN_REACQUIRE_MISSING_SECONDS,
+    LAST_KNOWN_REACQUIRE_MAX_TRACKS_PER_SIDE,
+    LAST_KNOWN_REACQUIRE_EXPAND_RATIO,
+    LAST_KNOWN_REACQUIRE_MIN_IOU_WITH_CANDIDATES,
+    STABLE_REPLACEMENT_CONFIRM_ENABLED,
+    STABLE_REPLACEMENT_CONFIRMATIONS,
+    STABLE_REPLACEMENT_CONFIRM_WINDOW_SECONDS,
+    STABLE_REPLACEMENT_BYPASS_ON_RAW_CHANGE,
+    RAW_VISUAL_CHANGE_CONFIRMATIONS,
+    RAW_VISUAL_CHANGE_CONFIRM_WINDOW_SECONDS,
+    RAW_VISUAL_CHANGE_DO_NOT_CLEAR_OVERLAY,
+    MANUAL_CHOICE_ENABLED,
+    MANUAL_CHOICE_TOP_N,
+    MANUAL_CHOICE_MIN_SCORE,
+    MANUAL_CHOICE_SHOW_FOR_LOW_CONFIDENCE,
+    MANUAL_CHOICE_LOW_CONFIDENCE_SCORE,
+    MANUAL_CHOICE_FORCE_FRONT,
+    MANUAL_CHOICE_TITLE,
+    CARD_BACK_REFINE_BOX_ENABLED,
+    CARD_BACK_REFINE_MIN_AREA_RATIO,
+    CARD_BACK_REFINE_MAX_AREA_RATIO,
+    CARD_BACK_REFINE_BORDER_DIFF_THRESHOLD,
+    CARD_BACK_USE_PROPOSAL_BOX,
+    MANUAL_CHOICE_OPEN_FOR_IDENTIFIED,
 )
 from .crop import crop_candidate
 from .detection import find_card_candidates
 from .obs_bridge import send_match_to_obs
+from .runtime_controls import auto_send_enabled
 from .tracking import CardTracker
 from .obs_queue import ObsFifoQueue
 from .corner_refine import dewarp_candidate_with_collectorvision
@@ -84,6 +113,17 @@ from .perf import snapshot as perf_snapshot
 from .stability import log_event, log_human_event, recent_events
 
 latest_matches = {"left": [], "right": []}
+
+manual_choice_state = {
+    "active": False,
+    "side": None,
+    "track_id": None,
+    "choices": [],
+    "title": "",
+    "x": 28,
+    "y": 92,
+    "source": None,
+}
 
 tracker = CardTracker(
     iou_threshold=TRACK_IOU_THRESHOLD,
@@ -241,14 +281,95 @@ def get_candidate_pil_image(frame, candidate):
         "reason": "refiner_disabled",
     }
 
+def refine_card_back_box(frame, candidate):
+    if not CARD_BACK_REFINE_BOX_ENABLED:
+        return None
 
-def card_back_result(refined, detail, signature):
+    box = candidate.get("box")
+    if box is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(box)
+
+    if w <= 8 or h <= 8:
+        return None
+
+    frame_h, frame_w = frame.shape[:2]
+    x = max(0, x)
+    y = max(0, y)
+    w = min(w, frame_w - x)
+    h = min(h, frame_h - y)
+
+    crop = frame[y:y + h, x:x + w]
+    if crop.size == 0:
+        return None
+
+    # Estimate local mat/background from the border of the proposal crop.
+    border = max(3, int(min(w, h) * 0.06))
+    top = crop[:border, :, :]
+    bottom = crop[-border:, :, :]
+    left = crop[:, :border, :]
+    right = crop[:, -border:, :]
+    border_pixels = np.concatenate([
+        top.reshape(-1, 3),
+        bottom.reshape(-1, 3),
+        left.reshape(-1, 3),
+        right.reshape(-1, 3),
+    ], axis=0).astype(np.float32)
+
+    bg = np.median(border_pixels, axis=0)
+
+    diff = crop.astype(np.float32) - bg.reshape(1, 1, 3)
+    dist = np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
+
+    mask = (dist > float(CARD_BACK_REFINE_BORDER_DIFF_THRESHOLD)).astype(np.uint8) * 255
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _hier = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    proposal_area = float(w * h)
+    best = None
+    best_area = 0.0
+
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        ratio = area / max(1.0, proposal_area)
+
+        if ratio < CARD_BACK_REFINE_MIN_AREA_RATIO or ratio > CARD_BACK_REFINE_MAX_AREA_RATIO:
+            continue
+
+        if area > best_area:
+            best_area = area
+            best = contour
+
+    if best is None:
+        return None
+
+    rect = cv2.minAreaRect(best)
+    refined = cv2.boxPoints(rect).astype(np.intp)
+    refined[:, 0] += x
+    refined[:, 1] += y
+
+    return refined
+
+
+
+def card_back_result(refined, detail, signature, refined_card_back_box=None):
     return {
         "id": "card_back",
         "score": 1.0,
         "margin": None,
         "rotation": "?",
-        "refined_box": refined.get("refined_box"),
+        "refined_box": (
+            refined.get("proposal_box")
+            if CARD_BACK_USE_PROPOSAL_BOX
+            else (refined_card_back_box if refined_card_back_box is not None else refined.get("refined_box"))
+        ),
         "proposal_box": refined.get("proposal_box"),
         "sharpness": refined.get("sharpness"),
         "confidence": refined.get("confidence"),
@@ -269,11 +390,13 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
     detail = analyze_crop_detail(base_image)
     signature = visual_signature(base_image)
 
+    card_back_box = refine_card_back_box(frame, candidate) if CARD_BACK_REFINE_BOX_ENABLED else None
+
     if candidate.get("force_card_back"):
-        return card_back_result(refined, detail, signature)
+        return card_back_result(refined, detail, signature, card_back_box)
 
     if looks_like_card_back(detail):
-        return card_back_result(refined, detail, signature)
+        return card_back_result(refined, detail, signature, card_back_box)
 
     if DEBUG_SAVE_CROPS:
         suffix = "opencv" if refined.get("fallback_to_opencv") else "cvrefined"
@@ -307,7 +430,24 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog):
     if not all_results:
         return None
 
+    unique_alternatives = []
+    seen_ids = set()
+
+    for result in all_results:
+        result_id = result.get("id")
+        if result_id in seen_ids:
+            continue
+        seen_ids.add(result_id)
+        unique_alternatives.append({
+            "id": result_id,
+            "score": float(result.get("score", 0.0)),
+            "rotation": result.get("rotation", "?"),
+        })
+        if len(unique_alternatives) >= MANUAL_CHOICE_TOP_N:
+            break
+
     best = all_results[0]
+    best["alternatives"] = unique_alternatives
 
     if len(all_results) > 1:
         second = all_results[1]
@@ -416,14 +556,43 @@ def update_raw_visual_state(frame, candidate, track, side, label, now_time):
     )
 
     if known_or_back and distance >= RAW_VISUAL_DIFF_THRESHOLD and cooldown_ok:
+        started = float(track.get("raw_visual_change_started_at", 0.0))
+        count = int(track.get("raw_visual_change_count", 0))
+
+        if started <= 0.0 or now_time - started > RAW_VISUAL_CHANGE_CONFIRM_WINDOW_SECONDS:
+            started = now_time
+            count = 0
+
+        count += 1
+        track["raw_visual_change_started_at"] = started
+        track["raw_visual_change_count"] = count
         track["pending_raw_signature"] = current
         track["last_raw_visual_diff_at"] = now_time
+        track["last_decision"] = f"raw_visual_candidate {count}/{RAW_VISUAL_CHANGE_CONFIRMATIONS} diff={distance:.3f}"
+
+        log_event(
+            side,
+            track.get("track_id"),
+            "raw_visual_candidate",
+            label=label,
+            diff=f"{distance:.3f}",
+            count=count,
+            required=RAW_VISUAL_CHANGE_CONFIRMATIONS,
+            threshold=f"{RAW_VISUAL_DIFF_THRESHOLD:.3f}",
+        )
+
+        if count < RAW_VISUAL_CHANGE_CONFIRMATIONS:
+            return False
+
         track["forced_visual_change_at"] = now_time
         track["raw_visual_change_pending"] = True
         track["force_new_identification"] = True
-        track["displayed"] = False
-        track["queued"] = False
-        track["refined_box"] = None
+
+        if not RAW_VISUAL_CHANGE_DO_NOT_CLEAR_OVERLAY:
+            track["displayed"] = False
+            track["queued"] = False
+            track["refined_box"] = None
+
         track["last_decision"] = f"raw_visual_change diff={distance:.3f}"
 
         log_event(
@@ -449,8 +618,10 @@ def update_raw_visual_state(frame, candidate, track, side, label, now_time):
     if distance < RAW_VISUAL_DIFF_LOG_THRESHOLD:
         track["last_raw_signature"] = current
         track["raw_visual_change_pending"] = False
+        track["raw_visual_change_count"] = 0
+        track["raw_visual_change_started_at"] = 0.0
 
-    elif known_or_back and cooldown_ok:
+    elif known_or_back and cooldown_ok and LOG_VISUAL_SAME_CHECKS:
         log_event(
             side,
             track.get("track_id"),
@@ -463,9 +634,365 @@ def update_raw_visual_state(frame, candidate, track, side, label, now_time):
     return False
 
 
+def candidate_iou_rect(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+
+    ix1 = max(ax, bx)
+    iy1 = max(ay, by)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+
+    if union <= 0:
+        return 0.0
+
+    return inter / union
+
+
+def candidate_from_track_last_box(track, frame):
+    rect = track.get("rect")
+    if rect is None:
+        box = track.get("box")
+        if box is None:
+            return None
+        rect = cv2.boundingRect(box)
+
+    x, y, w, h = rect
+    expand_x = int(w * LAST_KNOWN_REACQUIRE_EXPAND_RATIO)
+    expand_y = int(h * LAST_KNOWN_REACQUIRE_EXPAND_RATIO)
+
+    left = max(0, x - expand_x)
+    top = max(0, y - expand_y)
+    right = min(frame.shape[1] - 1, x + w + expand_x)
+    bottom = min(frame.shape[0] - 1, y + h + expand_y)
+
+    if right <= left or bottom <= top:
+        return None
+
+    box = np.array(
+        [[left, top], [right, top], [right, bottom], [left, bottom]],
+        dtype=np.intp,
+    )
+
+    return {
+        "box": box,
+        "area": float((right - left) * (bottom - top)),
+        "source": "last_known_reacquire",
+        "track_id_hint": track.get("track_id"),
+    }
+
+
+def add_last_known_reacquire_candidates(frame, side, candidates):
+    if not LAST_KNOWN_REACQUIRE_ENABLED:
+        return candidates
+
+    now_time = tracker.current_time()
+    existing_rects = [cv2.boundingRect(c["box"]) for c in candidates if c.get("box") is not None]
+    added = 0
+
+    # Prefer known/card_back tracks that have vanished from detection but are still recent.
+    tracks = sorted(
+        tracker.tracks.get(side, []),
+        key=lambda t: now_time - float(t.get("last_seen_at", 0.0)),
+    )
+
+    for track in tracks:
+        if added >= LAST_KNOWN_REACQUIRE_MAX_TRACKS_PER_SIDE:
+            break
+
+        label = track.get("label")
+        if label in (None, "", "unknown", "tracking"):
+            continue
+
+        missing_seconds = now_time - float(track.get("last_seen_at", 0.0))
+        if missing_seconds < LAST_KNOWN_REACQUIRE_MISSING_SECONDS:
+            continue
+
+        rect = track.get("rect")
+        if rect is None:
+            continue
+
+        overlaps_existing = False
+        for existing in existing_rects:
+            if candidate_iou_rect(rect, existing) >= LAST_KNOWN_REACQUIRE_MIN_IOU_WITH_CANDIDATES:
+                overlaps_existing = True
+                break
+
+        if overlaps_existing:
+            continue
+
+        candidate = candidate_from_track_last_box(track, frame)
+        if candidate is None:
+            continue
+
+        candidates.append(candidate)
+        existing_rects.append(cv2.boundingRect(candidate["box"]))
+        added += 1
+
+        log_event(
+            side,
+            track.get("track_id"),
+            "last_known_reacquire_candidate",
+            label=label,
+            missing=f"{missing_seconds:.2f}",
+            rect=str(rect),
+        )
+
+    return candidates
+
+
+def should_hold_stable_replacement(track, previous_label, best, forced_new):
+    if not STABLE_REPLACEMENT_CONFIRM_ENABLED:
+        return False
+
+    if best is None:
+        return False
+
+    if previous_label in (None, "", "unknown", "tracking", "card_back"):
+        return False
+
+    new_label = best.get("id")
+
+    if new_label in (None, "", "unknown", "tracking"):
+        return False
+
+    if new_label == previous_label:
+        track["pending_replacement_label"] = None
+        track["pending_replacement_count"] = 0
+        return False
+
+    raw_forced = bool(track.get("raw_visual_change_pending", False))
+    if raw_forced and STABLE_REPLACEMENT_BYPASS_ON_RAW_CHANGE:
+        track["pending_replacement_label"] = None
+        track["pending_replacement_count"] = 0
+        return False
+
+    now_time = tracker.current_time()
+    pending_label = track.get("pending_replacement_label")
+    pending_started = float(track.get("pending_replacement_started_at", 0.0))
+
+    if pending_label != new_label or now_time - pending_started > STABLE_REPLACEMENT_CONFIRM_WINDOW_SECONDS:
+        track["pending_replacement_label"] = new_label
+        track["pending_replacement_count"] = 1
+        track["pending_replacement_started_at"] = now_time
+    else:
+        track["pending_replacement_count"] = int(track.get("pending_replacement_count", 0)) + 1
+
+    count = int(track.get("pending_replacement_count", 0))
+
+    log_event(
+        track.get("side"),
+        track.get("track_id"),
+        "replacement_confirmation",
+        old=previous_label,
+        new=new_label,
+        count=count,
+        required=STABLE_REPLACEMENT_CONFIRMATIONS,
+    )
+
+    if count < STABLE_REPLACEMENT_CONFIRMATIONS:
+        track["last_decision"] = f"hold_replacement {previous_label}->{new_label} {count}/{STABLE_REPLACEMENT_CONFIRMATIONS}"
+        return True
+
+    track["pending_replacement_label"] = None
+    track["pending_replacement_count"] = 0
+    return False
+
+
+def should_offer_manual_choices(best):
+    if not MANUAL_CHOICE_ENABLED or best is None:
+        return False
+
+    choices = best.get("alternatives") or []
+    if not choices:
+        return False
+
+    best_id = best.get("id")
+    best_score = float(best.get("score", 0.0))
+
+    if best_id in (None, "", "unknown") and best_score >= MANUAL_CHOICE_MIN_SCORE:
+        return True
+
+    if MANUAL_CHOICE_SHOW_FOR_LOW_CONFIDENCE and best_score < MANUAL_CHOICE_LOW_CONFIDENCE_SCORE:
+        return True
+
+    return False
+
+
+
+def make_choice_from_card_id(card_id, score=1.0):
+    return {
+        "id": card_id,
+        "score": float(score),
+        "rotation": "manual",
+    }
+
+
+def build_contextual_choices(current_id=None, alternatives=None):
+    choices = []
+    seen = set()
+
+    if current_id not in (None, "", "unknown", "tracking", "card_back"):
+        choices.append(make_choice_from_card_id(current_id, 1.0))
+        seen.add(current_id)
+
+    for choice in alternatives or []:
+        card_id = choice.get("id")
+        if card_id in seen or card_id in (None, "", "unknown", "tracking", "card_back"):
+            continue
+        choices.append({
+            "id": card_id,
+            "score": float(choice.get("score", 0.0)),
+            "rotation": choice.get("rotation", "?"),
+        })
+        seen.add(card_id)
+        if len(choices) >= MANUAL_CHOICE_TOP_N:
+            break
+
+    return choices[:MANUAL_CHOICE_TOP_N]
+
+
+def open_manual_choices_for_track(side, track_id, title=None):
+    if not MANUAL_CHOICE_OPEN_FOR_IDENTIFIED:
+        return False
+
+    for track in tracker.tracks.get(side, []):
+        if track.get("track_id") != track_id:
+            continue
+
+        label = track.get("label")
+        choices = build_contextual_choices(label, track.get("last_alternatives") or [])
+
+        if not choices:
+            if label not in (None, "", "unknown", "tracking", "card_back"):
+                choices = [make_choice_from_card_id(label, float(track.get("score", 1.0)))]
+
+        if not choices:
+            return False
+
+        manual_choice_state["active"] = True
+        manual_choice_state["side"] = side
+        manual_choice_state["track_id"] = track_id
+        manual_choice_state["choices"] = choices
+        manual_choice_state["title"] = title or MANUAL_CHOICE_TITLE
+        manual_choice_state["source"] = "right_click"
+
+        box = track.get("box")
+        if box is not None:
+            bx, by, bw, bh = cv2.boundingRect(box)
+            manual_choice_state["x"] = int(bx + bw + 14)
+            manual_choice_state["y"] = int(max(8, by - 8))
+
+        log_event(
+            side,
+            track_id,
+            "manual_choices_opened_for_track",
+            label=label,
+            choices="|".join(c.get("id", "") for c in choices),
+        )
+        return True
+
+    return False
+
+
+def open_manual_choices(side, track, best, title=None):
+    choices = build_contextual_choices(None, best.get("alternatives") or [])
+
+    if not choices:
+        return False
+
+    manual_choice_state["active"] = True
+    manual_choice_state["side"] = side
+    manual_choice_state["track_id"] = track.get("track_id")
+    manual_choice_state["choices"] = choices
+    manual_choice_state["title"] = title or MANUAL_CHOICE_TITLE
+
+    box = track.get("box")
+    if box is not None:
+        bx, by, bw, bh = cv2.boundingRect(box)
+        manual_choice_state["x"] = int(bx + bw + 14)
+        manual_choice_state["y"] = int(max(8, by - 8))
+
+    log_event(
+        side,
+        track.get("track_id"),
+        "manual_choices_opened",
+        choices="|".join(f"{c.get('id')}:{c.get('score', 0.0):.2f}" for c in choices),
+    )
+    return True
+
+
+def apply_manual_choice(choice_index):
+    if not manual_choice_state.get("active"):
+        return False
+
+    choices = manual_choice_state.get("choices") or []
+    if choice_index < 0 or choice_index >= len(choices):
+        return False
+
+    side = manual_choice_state.get("side")
+    track_id = manual_choice_state.get("track_id")
+    choice = choices[choice_index]
+    card_id = choice.get("id")
+    score = float(choice.get("score", 1.0))
+
+    for track in tracker.tracks.get(side, []):
+        if track.get("track_id") != track_id:
+            continue
+
+        old_label = track.get("label")
+        track["label"] = card_id
+        track["score"] = score
+        track["margin"] = None
+        track["displayed"] = False
+        track["queued"] = False
+        track["last_processed_at"] = tracker.current_time()
+        track["last_decision"] = f"manual_choice:{card_id}"
+        track["pending_replacement_label"] = None
+        track["pending_replacement_count"] = 0
+
+        if MANUAL_CHOICE_FORCE_FRONT and card_id not in (None, "", "unknown", "tracking", "card_back"):
+            obs_queue.enqueue_front(
+                side=side,
+                card_id=card_id,
+                score=score,
+                track=track,
+            )
+
+        latest_matches[side] = tracker.get_visible_matches(side)
+
+        log_event(
+            side,
+            track_id,
+            "manual_choice_applied",
+            old=old_label,
+            new=card_id,
+            score=f"{score:.2f}",
+        )
+
+        manual_choice_state["active"] = False
+        return True
+
+    manual_choice_state["active"] = False
+    return False
+
+
+def close_manual_choices():
+    manual_choice_state["active"] = False
+    return True
+
+
 
 def scan_side_for_matches(frame, roi, side, catalog):
     candidates = find_card_candidates(frame, roi)
+    candidates = add_last_known_reacquire_candidates(frame, side, candidates)
 
     scan_items = []
     considered = 0
@@ -728,9 +1255,16 @@ def scan_side_for_matches(frame, roi, side, catalog):
             )
             continue
 
+        if should_hold_stable_replacement(track, previous_label, best, forced_new):
+            track["last_processed_at"] = tracker.current_time()
+            held_unknown += 1
+            continue
+
         if best is not None and best.get("id") != "unknown":
             track["unknown_streak"] = 0
 
+        if best is not None:
+            track["last_alternatives"] = best.get("alternatives") or []
         tracker.apply_recognition_result(track, best)
         track["force_new_identification"] = False
 
@@ -747,50 +1281,58 @@ def scan_side_for_matches(frame, roi, side, catalog):
         if current_label != previous_label:
             label_changes += 1
 
+        visual_refresh_same_label = (
+            bool(track.get("raw_visual_change_pending", False))
+            and current_label == previous_label
+        )
+
         if (
             current_label
             and current_label not in ("unknown", "card_back")
             and current_score >= CONFIDENCE_THRESHOLD
+            and not visual_refresh_same_label
             and (
                 current_label != previous_label
                 or not track.get("displayed", False)
             )
             and not track.get("queued", False)
         ):
-            if OBS_QUEUE_ENABLED:
-                obs_queue.enqueue_match(
-                    side=side,
-                    card_id=current_label,
-                    score=current_score,
-                    track=track,
-                )
-            elif AUTO_SEND_TO_OBS:
-                send_match_to_obs(side, current_label)
+            if auto_send_enabled():
+                if OBS_QUEUE_ENABLED:
+                    obs_queue.enqueue_match(
+                        side=side,
+                        card_id=current_label,
+                        score=current_score,
+                        track=track,
+                    )
+                elif AUTO_SEND_TO_OBS:
+                    send_match_to_obs(side, current_label)
 
-    log_event(
-        side,
-        "side",
-        "scan_summary",
-        candidates=considered,
-        queued=len(scan_items),
-        processed=processed,
-        skipped_known=skipped_known,
-        skipped_cooldown=skipped_cooldown,
-        held_unknown=held_unknown,
-        label_changes=label_changes,
-    )
-    log_human_event(
-        side,
-        "side",
-        "scan_summary",
-        candidates=considered,
-        queued=len(scan_items),
-        processed=processed,
-        skipped_known=skipped_known,
-        skipped_cooldown=skipped_cooldown,
-        held_unknown=held_unknown,
-        label_changes=label_changes,
-    )
+    if LOG_SCAN_SUMMARIES or DEBUG_VERBOSE_STABILITY_LOGS:
+        log_event(
+            side,
+            "side",
+            "scan_summary",
+            candidates=considered,
+            queued=len(scan_items),
+            processed=processed,
+            skipped_known=skipped_known,
+            skipped_cooldown=skipped_cooldown,
+            held_unknown=held_unknown,
+            label_changes=label_changes,
+        )
+        log_human_event(
+            side,
+            "side",
+            "scan_summary",
+            candidates=considered,
+            queued=len(scan_items),
+            processed=processed,
+            skipped_known=skipped_known,
+            skipped_cooldown=skipped_cooldown,
+            held_unknown=held_unknown,
+            label_changes=label_changes,
+        )
 
     latest_matches[side] = tracker.get_visible_matches(side)
 
@@ -812,6 +1354,7 @@ def get_scanner_status():
         "obs_queue": obs_queue.snapshot(),
         "perf": perf_snapshot(),
         "stability_events": recent_events(6),
+        "manual_choice": dict(manual_choice_state),
     }
 
 
@@ -978,6 +1521,17 @@ def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog):
         best = recognize_candidate_crop(frame, candidate, side, 999, catalog)
 
     previous_label = track.get("label")
+
+    if should_offer_manual_choices(best):
+        track["last_alternatives"] = best.get("alternatives") or []
+        tracker.apply_recognition_result(track, best)
+        open_manual_choices(side, track, best, title=MANUAL_CHOICE_TITLE)
+        if MANUAL_BOX_PRESERVE_VISIBLE_MATCHES:
+            refresh_latest_matches_preserving(side, before_matches)
+        else:
+            latest_matches[side] = tracker.get_visible_matches(side)
+        return track
+
     tracker.apply_recognition_result(track, best)
 
     current_label = track.get("label")
@@ -1102,6 +1656,14 @@ def scan_point_for_card(frame, x, y, side, catalog):
     track["last_decision"] = f"manual_point_scan source={candidate.get('source')}"
 
     previous_label = track.get("label")
+
+    if should_offer_manual_choices(best):
+        track["last_alternatives"] = best.get("alternatives") or []
+        tracker.apply_recognition_result(track, best)
+        open_manual_choices(side, track, best, title=MANUAL_CHOICE_TITLE)
+        refresh_latest_matches_preserving(side, before_matches)
+        return track
+
     tracker.apply_recognition_result(track, best)
 
     current_label = track.get("label")

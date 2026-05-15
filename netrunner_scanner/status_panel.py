@@ -2,6 +2,14 @@
 import cv2
 import numpy as np
 
+from .runtime_controls import get_settings, is_dirty
+
+last_controls = {}
+
+
+def get_last_controls():
+    return dict(last_controls)
+
 from .config import (
     GUI_STATUS_MAX_QUEUE_ITEMS,
     GUI_STATUS_MAX_RECOGNIZED_ITEMS,
@@ -11,6 +19,14 @@ from .config import (
     STATUS_MAX_STABILITY_EVENTS,
     STATUS_PANEL_COMPACT_MODE,
     STATUS_PANEL_SHOW_RECOGNIZED_LISTS,
+    STATUS_PANEL_POLISHED,
+    STATUS_PANEL_SHOW_LEGEND,
+    STATUS_PANEL_SHOW_LAST_SENT,
+    APP_NAME,
+    APP_VERSION,
+    STATUS_PANEL_SHOW_CONTROLS,
+    CONTROL_QUEUE_SECONDS_MIN,
+    CONTROL_QUEUE_SECONDS_MAX,
 )
 
 
@@ -39,8 +55,13 @@ def draw_text(panel, text, x, y, scale=0.48, color=(230, 230, 230), thickness=1)
 
 
 def draw_section_header(panel, title, y):
-    cv2.rectangle(panel, (0, y - 18), (panel.shape[1], y + 8), (45, 45, 45), -1)
-    draw_text(panel, title, 12, y, scale=0.52, color=(255, 255, 255), thickness=1)
+    if STATUS_PANEL_POLISHED:
+        cv2.rectangle(panel, (0, y - 20), (panel.shape[1], y + 9), (38, 38, 42), -1)
+        cv2.line(panel, (0, y + 9), (panel.shape[1], y + 9), (62, 62, 66), 1)
+        draw_text(panel, title, 14, y, scale=0.50, color=(245, 245, 245), thickness=1)
+    else:
+        cv2.rectangle(panel, (0, y - 18), (panel.shape[1], y + 8), (45, 45, 45), -1)
+        draw_text(panel, title, 12, y, scale=0.52, color=(255, 255, 255), thickness=1)
 
 
 def draw_legend(panel, y):
@@ -284,22 +305,111 @@ def draw_stability_events(panel, events, y):
     return y + 8
 
 
+
+def draw_radio(panel, label, x, y, active):
+    color = (0, 220, 255) if active else (120, 120, 120)
+    cv2.circle(panel, (x + 8, y - 5), 7, color, 1, cv2.LINE_AA)
+    if active:
+        cv2.circle(panel, (x + 8, y - 5), 4, color, -1, cv2.LINE_AA)
+    draw_text(panel, label, x + 24, y, scale=0.40, color=(220, 220, 220))
+
+
+def draw_button_panel(panel, label, rect, active=False):
+    x, y, w, h = rect
+    bg = (48, 54, 58) if active else (38, 38, 42)
+    border = (0, 220, 255) if active else (90, 90, 98)
+    cv2.rectangle(panel, (x, y), (x + w, y + h), bg, -1)
+    cv2.rectangle(panel, (x, y), (x + w, y + h), border, 1)
+    draw_text(panel, label, x + 8, y + 21, scale=0.40, color=(230, 230, 230))
+
+
+def draw_controls(panel, y):
+    draw_section_header(panel, "Controls", y)
+    y += 30
+
+    settings = get_settings()
+    mode = settings.get("mode", "automatic")
+    respect_queue = bool(settings.get("manual_click_respect_queue", False))
+    wait = float(settings.get("queue_wait_seconds", 8.0))
+
+    buttons = {}
+
+    draw_text(panel, "Recognition mode", 16, y, scale=0.40, color=(170, 170, 170))
+    y += 23
+
+    buttons["mode_auto"] = (18, y - 20, 132, 26)
+    buttons["mode_manual"] = (160, y - 20, 132, 26)
+    draw_radio(panel, "Automatic", 20, y, mode == "automatic")
+    draw_radio(panel, "Manual", 162, y, mode == "manual")
+    y += 34
+
+    draw_text(panel, "Left-click OBS send", 16, y, scale=0.40, color=(170, 170, 170))
+    y += 23
+
+    buttons["click_instant"] = (18, y - 20, 132, 26)
+    buttons["click_queue"] = (160, y - 20, 132, 26)
+    draw_radio(panel, "Instant", 20, y, not respect_queue)
+    draw_radio(panel, "Use queue", 162, y, respect_queue)
+    y += 36
+
+    draw_text(panel, f"Queue wait: {wait:.1f}s", 16, y, scale=0.42, color=(220, 220, 220))
+    y += 24
+
+    slider_x = 22
+    slider_y = y
+    slider_w = panel.shape[1] - 58
+    slider_h = 8
+    cv2.line(panel, (slider_x, slider_y + 4), (slider_x + slider_w, slider_y + 4), (105, 105, 112), 2, cv2.LINE_AA)
+    frac = (wait - float(CONTROL_QUEUE_SECONDS_MIN)) / max(0.001, float(CONTROL_QUEUE_SECONDS_MAX) - float(CONTROL_QUEUE_SECONDS_MIN))
+    frac = max(0.0, min(1.0, frac))
+    knob_x = int(slider_x + frac * slider_w)
+    cv2.circle(panel, (knob_x, slider_y + 4), 8, (0, 220, 255), -1, cv2.LINE_AA)
+    draw_text(panel, f"{CONTROL_QUEUE_SECONDS_MIN:.0f}", slider_x, slider_y + 25, scale=0.34, color=(130, 130, 130))
+    draw_text(panel, f"{CONTROL_QUEUE_SECONDS_MAX:.0f}", slider_x + slider_w - 14, slider_y + 25, scale=0.34, color=(130, 130, 130))
+    y += 48
+
+    save_label = "Save settings" + (" *" if is_dirty() else "")
+    buttons["save"] = (18, y - 20, panel.shape[1] - 36, 28)
+    draw_button_panel(panel, save_label, buttons["save"], active=is_dirty())
+    y += 42
+
+    controls = {
+        "buttons": buttons,
+        "slider": (slider_x, slider_y - 8, slider_w, slider_h + 16),
+    }
+
+    return y + 8, controls
+
+
 def make_status_sidebar(height, status):
     panel = np.zeros((height, GUI_STATUS_SIDEBAR_WIDTH, 3), dtype=np.uint8)
-    panel[:] = (24, 24, 24)
+    panel[:] = (19, 20, 23) if STATUS_PANEL_POLISHED else (24, 24, 24)
+
+    if STATUS_PANEL_POLISHED:
+        cv2.rectangle(panel, (0, 0), (panel.shape[1], 44), (26, 27, 31), -1)
+        cv2.line(panel, (0, 44), (panel.shape[1], 44), (55, 55, 60), 1)
 
     y = 28
-    draw_text(panel, "CollectorVision Status", 12, y, scale=0.62, color=(255, 255, 255), thickness=1)
-    y += 28
+    draw_text(panel, f"{APP_NAME} v{APP_VERSION}", 14, y, scale=0.60, color=(248, 248, 248), thickness=1)
+    y += 30
 
-    y = draw_legend(panel, y)
+    global last_controls
+
+    if STATUS_PANEL_SHOW_CONTROLS:
+        y, last_controls = draw_controls(panel, y)
+    else:
+        last_controls = {}
+
+    if STATUS_PANEL_SHOW_LEGEND and not STATUS_PANEL_COMPACT_MODE:
+        y = draw_legend(panel, y)
+
     y = draw_perf(panel, status, y)
     y = draw_stability_events(panel, status.get("stability_events", []), y)
 
     queue_snapshot = status.get("obs_queue", {})
     y = draw_queue(panel, queue_snapshot, y)
 
-    if not STATUS_PANEL_COMPACT_MODE:
+    if STATUS_PANEL_SHOW_LAST_SENT and not STATUS_PANEL_COMPACT_MODE:
         y = draw_last_sent(panel, queue_snapshot, y)
 
     if STATUS_PANEL_SHOW_RECOGNIZED_LISTS:
