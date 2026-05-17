@@ -1,10 +1,16 @@
 import cv2
-from pygrabber.dshow_graph import FilterGraph
+
+try:
+    from pygrabber.dshow_graph import FilterGraph
+except Exception:  # pragma: no cover - exercised on systems without pygrabber
+    FilterGraph = None
 
 from .config import CAMERA_NAME, REQUEST_WIDTH, REQUEST_HEIGHT, REQUEST_FPS, OPENCV_NUM_THREADS
 
 
 def list_cameras():
+    if FilterGraph is None:
+        raise RuntimeError("pygrabber is required to enumerate Windows video sources")
     graph = FilterGraph()
     return graph.get_input_devices()
 
@@ -65,16 +71,12 @@ def format_camera_info(info):
     width = int(info.get("width") or 0)
     height = int(info.get("height") or 0)
     fps = _safe_float(info.get("fps"), 0.0)
-
     if width > 0 and height > 0 and fps > 0:
         return f"{width}x{height} @ {fps:.1f} fps"
-
     if width > 0 and height > 0:
         return f"{width}x{height}"
-
     if fps > 0:
         return f"{fps:.1f} fps"
-
     return ""
 
 
@@ -87,13 +89,17 @@ def list_video_sources(probe=False):
         # immediately by default and only includes metadata when the caller
         # explicitly asks for a probe.
         info = probe_camera_info(i) if probe else {"width": 0, "height": 0, "fps": 0.0}
+        info_text = format_camera_info(info)
+        label = f"{i}: {name}"
+        if info_text:
+            label = f"{label} — {info_text}"
         sources.append({
             "index": i,
             "name": name,
             "width": int(info.get("width") or 0),
             "height": int(info.get("height") or 0),
             "fps": _safe_float(info.get("fps"), 0.0),
-            "label": f"{i}: {name} — {format_camera_info(info)}",
+            "label": label,
         })
     return sources
 

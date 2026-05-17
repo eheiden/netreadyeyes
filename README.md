@@ -188,3 +188,26 @@ Install `psutil` for CPU-load measurements:
 ```powershell
 .\.venv\Scripts\python.exe -m pip install psutil
 ```
+
+## Local pre-push checks
+
+Run the lightweight test suite before pushing changes:
+
+```powershell
+.\run_tests.ps1
+```
+
+or:
+
+```powershell
+python .\scripts\run_pre_push_tests.py
+```
+
+The checks compile the main Python files and run the unit tests in `tests/`. They intentionally avoid opening cameras, OBS, or GUI windows, so they should be safe to run quickly while developing.
+
+To install an optional local Git pre-push hook:
+
+```powershell
+python .\scripts\install_git_hooks.py
+```
+
