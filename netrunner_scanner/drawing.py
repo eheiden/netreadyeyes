@@ -1,6 +1,8 @@
 
 import cv2
-from .config import HANDLE_SIZE, DRAW_LABEL_SHADOWS, ROI_LEFT_LABEL, ROI_RIGHT_LABEL, ROI_LEFT_LABEL, ROI_RIGHT_LABEL
+import numpy as np
+from .config import HANDLE_SIZE, DRAW_LABEL_SHADOWS, ROI_LEFT_LABEL, ROI_RIGHT_LABEL
+from .roi import roi_points, roi_to_rect, roi_enabled, roi_color, hover_state, drag_state, roi_edit_enabled, show_roi_labels
 
 ROI_LEFT_COLOR = (0, 255, 0)
 ROI_RIGHT_COLOR = (255, 0, 0)
@@ -40,28 +42,63 @@ def draw_label(frame, text, origin, color, scale=0.58, thickness=2):
     )
 
 
+def _lighten_bgr(color, amount=80):
+    return tuple(min(255, int(c) + amount) for c in color)
+
+
 def draw_roi(frame, side, roi):
-    x, y, w, h = roi
+    if roi is None:
+        return
 
-    if side == "left":
-        color = ROI_LEFT_COLOR
-        label = ROI_LEFT_LABEL
-    else:
-        color = ROI_RIGHT_COLOR
-        label = ROI_RIGHT_LABEL
+    color = roi_color(roi, ROI_LEFT_COLOR if side == "left" else ROI_RIGHT_COLOR)
+    label = ROI_LEFT_LABEL if side == "left" else ROI_RIGHT_LABEL
+    enabled = roi_enabled(roi)
+    pts = roi_points(roi)
 
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    if pts is None:
+        return
 
-    for hx, hy in [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]:
-        cv2.rectangle(
-            frame,
-            (hx - HANDLE_SIZE // 2, hy - HANDLE_SIZE // 2),
-            (hx + HANDLE_SIZE // 2, hy + HANDLE_SIZE // 2),
-            color,
-            -1,
-        )
+    pts_i = pts.astype(np.int32)
+    x, y, w, h = roi_to_rect(roi)
 
-    draw_label(frame, label, (x + 12, y + 32), color, scale=0.82, thickness=2)
+    edit_mode = roi_edit_enabled()
+    is_hovered = edit_mode and hover_state.get("side") == side
+    is_dragged = edit_mode and drag_state.get("active") and drag_state.get("side") == side
+    active = is_hovered or is_dragged
+    draw_color = _lighten_bgr(color, 55) if active else color
+    thickness = 3 if active else 2
+
+    if not enabled:
+        draw_color = (90, 90, 90)
+        thickness = 1
+
+    cv2.polylines(frame, [pts_i], True, draw_color, thickness, cv2.LINE_AA)
+
+    # Soft fill while hovered/dragged so it is obvious the mouse is in an editable spot.
+    if active and enabled:
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [pts_i], draw_color)
+        cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+
+    for idx, (hx, hy) in enumerate(pts_i):
+        radius = max(4, HANDLE_SIZE // 2) if edit_mode else 2
+        if active and hover_state.get("mode", "").startswith("corner"):
+            radius += 2
+        cv2.circle(frame, (int(hx), int(hy)), radius, draw_color, -1, cv2.LINE_AA)
+        cv2.circle(frame, (int(hx), int(hy)), radius + 2, (0, 0, 0), 1, cv2.LINE_AA)
+
+    mode = hover_state.get("mode") if is_hovered else None
+    hint = ""
+    if edit_mode and mode == "move":
+        hint = "  drag to move"
+    elif edit_mode and mode and mode.startswith("corner"):
+        hint = "  drag corner to dewarp"
+    elif edit_mode and mode and mode.startswith("edge"):
+        hint = "  drag edge"
+
+    if show_roi_labels():
+        disabled = " OFF" if not enabled else ""
+        draw_label(frame, f"{label}{disabled}{hint}", (x + 12, y + 32), draw_color, scale=0.82, thickness=2)
 
 
 def is_known_card_label(label):

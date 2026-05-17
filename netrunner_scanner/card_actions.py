@@ -2,11 +2,14 @@ import time
 
 import cv2
 
-from .recognition import latest_matches, tracker, obs_queue, scan_point_for_card, scan_box_for_card, manual_choice_state, apply_manual_choice, close_manual_choices, open_manual_choices_for_track, manual_selector_append_char, manual_selector_backspace, manual_selector_set_query
-from .roi import rois, point_in_roi, on_mouse as roi_on_mouse
-from .display_utils import display_to_source
-from .runtime_controls import manual_click_respects_queue, handle_control_click
+from .recognition import latest_matches, tracker, obs_queue, scan_point_for_card, scan_box_for_card, scan_region_for_cards_aggressive, manual_choice_state, apply_manual_choice, close_manual_choices, open_manual_choices_for_track, manual_selector_append_char, manual_selector_backspace, manual_selector_set_query
+from .roi import rois, point_in_roi, on_mouse as roi_on_mouse, drag_state, hover_state, roi_edit_enabled
+from .runtime_controls import manual_click_respects_queue
 from .config import GUI_DISPLAY_SCALE, LEFT_CLICK_FORCE_OBS, RIGHT_CLICK_CARD_MENU, MANUAL_DRAG_SCAN_ENABLED, MANUAL_DRAG_MIN_WIDTH_PX, MANUAL_DRAG_MIN_HEIGHT_PX, MANUAL_DRAG_PROCESS_SYNC, MANUAL_POINT_SCAN_ON_CLICK, RIGHT_CLICK_CLEAR_DELETES_TRACK, MANUAL_CHOICE_WIDTH, MANUAL_CHOICE_ROW_HEIGHT, MANUAL_CHOICE_MARGIN, MANUAL_CHOICE_TITLE
+
+SELECTED_TRACK_COLOR = (255, 180, 0)  # bright cyan/blue in OpenCV BGR; intentionally not yellow.
+SELECTION_RECT_COLOR = (255, 180, 0)
+AGGRESSIVE_SCAN_RECT_COLOR = (0, 0, 255)
 
 menu_state = {
     "active": False,
@@ -25,7 +28,12 @@ menu_state = {
     "pending_click_start": None,
     "pending_click_side": None,
     "choice_buttons": {},
+    "selecting_tracks": False,
+    "selection_start": None,
+    "selection_current": None,
+    "selected_tracks": set(),
 }
+
 
 runtime = {
     "frame_getter": None,
@@ -37,38 +45,183 @@ runtime = {
 }
 
 
+def clear_all_tracks(side=None):
+    sides = ("left", "right") if side is None else (str(side),)
+    total = sum(len(tracker.tracks.get(s, [])) for s in sides)
+    for s in sides:
+        tracker.tracks[s] = []
+        latest_matches[s] = []
+    menu_state["selected_tracks"] = {item for item in menu_state.get("selected_tracks", set()) if item[0] not in sides}
+    label = "all playmats" if side is None else f"{side} playmat"
+    print(f"Cleared {label} tracks ({total}).")
+    return total
+
+
+def _normalize_rect_from_points(a, b):
+    x1, y1 = a
+    x2, y2 = b
+    return min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
+
+
+def _rects_intersect(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+
+
+def _rect_contains_rect(outer, inner):
+    """Return True only when inner is fully inside outer.
+
+    Track selection should be intentional: a marquee that merely brushes a
+    card should not select it.  This replaces the older intersect-based
+    behavior.
+    """
+    ox, oy, ow, oh = outer
+    ix, iy, iw, ih = inner
+    return (
+        ix >= ox
+        and iy >= oy
+        and ix + iw <= ox + ow
+        and iy + ih <= oy + oh
+    )
+
+
+
+
+def _first_match_box(match):
+    for key in ("box", "refined_box", "proposal_box"):
+        value = match.get(key)
+        if value is not None:
+            return value
+    return None
+
+def update_selected_tracks_from_rect(rect):
+    selected = set()
+    for side in ("left", "right"):
+        for match in latest_matches.get(side, []):
+            box = _first_match_box(match)
+            track_id = match.get("track_id")
+            if box is None or track_id is None:
+                continue
+            if _rect_contains_rect(rect, cv2.boundingRect(box)):
+                selected.add((side, track_id))
+    menu_state["selected_tracks"] = selected
+    return selected
+
+
+def delete_selected_tracks():
+    selected = set(menu_state.get("selected_tracks") or set())
+    if not selected:
+        return 0
+    deleted = 0
+    for side, track_id in list(selected):
+        if clear_track_identification(side, track_id):
+            deleted += 1
+    menu_state["selected_tracks"] = set()
+    print(f"Deleted selected tracks ({deleted}).")
+    return deleted
+
+
+def rescan_selected_tracks():
+    selected = set(menu_state.get("selected_tracks") or set())
+    if not selected:
+        return 0
+
+    frame_getter = runtime.get("frame_getter")
+    frame = frame_getter() if frame_getter is not None else None
+    if frame is None:
+        return 0
+
+    box_submitter = runtime.get("box_submitter")
+    catalog = runtime.get("catalog")
+    count = 0
+
+    for side, track_id in list(selected):
+        match = None
+        for candidate in latest_matches.get(side, []):
+            if candidate.get("track_id") == track_id:
+                match = candidate
+                break
+
+        if match is None:
+            continue
+
+        box = _first_match_box(match)
+        if box is None:
+            continue
+
+        x, y, w, h = cv2.boundingRect(box)
+        if w <= 0 or h <= 0:
+            continue
+
+        print(f"Manual rescan selected track: {side} track {track_id}")
+        # Same reason as manual click: selected-track rescans need immediate
+        # aggressive feedback and access to fresh best-of-N frames.
+        scan_box_for_card(frame, x, y, x + w, y + h, side, catalog, frame_getter=frame_getter)
+        count += 1
+
+    return count
+
+
+def draw_track_selection(frame):
+    selected = set(menu_state.get("selected_tracks") or set())
+    if selected:
+        for side, track_id in selected:
+            for match in latest_matches.get(side, []):
+                if match.get("track_id") != track_id:
+                    continue
+                box = _first_match_box(match)
+                if box is not None:
+                    cv2.drawContours(frame, [box], 0, SELECTED_TRACK_COLOR, 4)
+
+    if menu_state.get("selecting_tracks"):
+        start = menu_state.get("selection_start")
+        current = menu_state.get("selection_current")
+        if start is None or current is None:
+            return
+        x, y, w, h = _normalize_rect_from_points(start, current)
+        if w < MANUAL_DRAG_MIN_WIDTH_PX and h < MANUAL_DRAG_MIN_HEIGHT_PX:
+            return
+        selected = update_selected_tracks_from_rect((x, y, w, h))
+        if selected:
+            color = SELECTION_RECT_COLOR
+            label = f"select {len(selected)} track(s)"
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+        else:
+            color = AGGRESSIVE_SCAN_RECT_COLOR
+            label = "force scan area"
+            # Dashed rectangle so it is visually distinct from normal selection.
+            dash = 16
+            gap = 10
+            for xx in range(x, x + w, dash + gap):
+                cv2.line(frame, (xx, y), (min(xx + dash, x + w), y), color, 2)
+                cv2.line(frame, (xx, y + h), (min(xx + dash, x + w), y + h), color, 2)
+            for yy in range(y, y + h, dash + gap):
+                cv2.line(frame, (x, yy), (x, min(yy + dash, y + h)), color, 2)
+                cv2.line(frame, (x + w, yy), (x + w, min(yy + dash, y + h)), color, 2)
+        cv2.putText(frame, label, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA)
+
+
 def handle_status_panel_click(x, y):
-    scaled_x, scaled_y = display_to_source(x, y)
-
-    frame_size_getter = runtime.get("frame_size_getter")
-    controls_getter = runtime.get("status_controls_getter")
-
-    if frame_size_getter is None or controls_getter is None:
-        return False
-
-    frame_width, _frame_height = frame_size_getter()
-    scale = float(GUI_DISPLAY_SCALE)
-    if scale <= 0:
-        scale = 1.0
-
-    scaled_frame_w = int(frame_width * scale)
-
-    if scaled_x < scaled_frame_w:
-        return False
-
-    sidebar_x = int(scaled_x - scaled_frame_w)
-    sidebar_y = int(scaled_y)
-
-    return handle_control_click(sidebar_x, sidebar_y, controls_getter())
+    # Runtime controls now live in the Tk menu/ribbon instead of the drawn
+    # OpenCV status sidebar, so sidebar clicks are intentionally ignored.
+    return False
 
 
 def display_click_to_frame_coords(x, y):
-    scaled_x, scaled_y = display_to_source(x, y)
+    """Map Tk image coordinates back to the camera frame.
 
+    The previous OpenCV-window helper used cv2.getWindowImageRect(), but this
+    app now renders frames inside a Tk Label.  That helper never received the
+    Tk image size, so coordinates were clamped near (0, 0), which made drag
+    selection appear broken.  In the Tk path the image is shown 1:1 after the
+    explicit GUI_DISPLAY_SCALE resize, so this mapping only needs to undo that
+    configured scale and ignore the status sidebar area.
+    """
     frame_size_getter = runtime.get("frame_size_getter")
 
     if frame_size_getter is None:
-        return int(scaled_x), int(scaled_y)
+        return int(x), int(y)
 
     frame_width, frame_height = frame_size_getter()
 
@@ -76,18 +229,14 @@ def display_click_to_frame_coords(x, y):
     if scale <= 0:
         scale = 1.0
 
-    scaled_frame_w = int(frame_width * scale)
-    scaled_frame_h = int(frame_height * scale)
+    preview_w = int(frame_width * scale)
+    preview_h = int(frame_height * scale)
 
-    # Ignore clicks in the status sidebar or outside the camera preview.
-    if scaled_x < 0 or scaled_y < 0:
+    if x < 0 or y < 0 or x >= preview_w or y >= preview_h:
         return None
 
-    if scaled_x >= scaled_frame_w or scaled_y >= scaled_frame_h:
-        return None
-
-    source_x = int(scaled_x / scale)
-    source_y = int(scaled_y / scale)
+    source_x = int(x / scale)
+    source_y = int(y / scale)
 
     source_x = max(0, min(source_x, frame_width - 1))
     source_y = max(0, min(source_y, frame_height - 1))
@@ -109,6 +258,33 @@ def force_match_to_front(side, match):
     if track_id is None:
         return False
     return force_track_to_front(side, track_id)
+
+
+def send_match_from_left_click(side, match):
+    """Send the clicked track using the configured On Left-click behavior."""
+    track_id = match.get("track_id")
+    if track_id is None:
+        return False
+
+    for track in tracker.tracks.get(side, []):
+        if track.get("track_id") != track_id:
+            continue
+
+        label = track.get("label")
+        if label in (None, "", "unknown", "tracking", "card_back"):
+            print(f"Cannot send track {track_id}; label is {label}")
+            return False
+
+        score = float(track.get("score", 1.0))
+        if manual_click_respects_queue():
+            obs_queue.enqueue_match(side=side, card_id=label, score=score, track=track)
+            print(f"On Left-click queued for OBS: {side} {label}")
+        else:
+            obs_queue.send_immediate(side=side, card_id=label, score=score, track=track)
+            print(f"On Left-click sent to OBS immediately: {side} {label}")
+        return True
+
+    return False
 
 
 def draw_manual_drag_box(frame):
@@ -335,7 +511,13 @@ def run_menu_action(action):
         return True
 
     if action == "selector":
-        open_manual_choices_for_track, manual_selector_append_char, manual_selector_backspace, manual_selector_set_query(side, track_id)
+        open_manual_choices_for_track(side, track_id)
+        menu_state["active"] = False
+        return True
+
+    if action == "rescan":
+        menu_state["selected_tracks"] = {(side, track_id)}
+        rescan_selected_tracks()
         menu_state["active"] = False
         return True
 
@@ -374,7 +556,7 @@ def draw_card_menu(frame):
     y = int(menu_state["y"])
 
     w = 360
-    h = 174
+    h = 216
 
     frame_h, frame_w = frame.shape[:2]
     x = min(x, frame_w - w - 4)
@@ -386,8 +568,9 @@ def draw_card_menu(frame):
     menu_state["y"] = y
     menu_state["buttons"] = {
         "selector": (x + 14, y + 40, w - 28, 34),
-        "force": (x + 14, y + 82, w - 28, 34),
-        "clear": (x + 14, y + 124, w - 28, 34),
+        "rescan": (x + 14, y + 82, w - 28, 34),
+        "force": (x + 14, y + 124, w - 28, 34),
+        "clear": (x + 14, y + 166, w - 28, 34),
     }
 
     cv2.rectangle(frame, (x, y), (x + w, y + h), (25, 25, 25), -1)
@@ -396,8 +579,9 @@ def draw_card_menu(frame):
     cv2.putText(frame, "Card actions", (x + 14, y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
 
     draw_button(frame, "selector", "Open manual card selector", menu_state["buttons"]["selector"])
+    draw_button(frame, "rescan", "Manual rescan this track", menu_state["buttons"]["rescan"])
     draw_button(frame, "force", "Force to front of OBS queue", menu_state["buttons"]["force"])
-    draw_button(frame, "clear", "Delete track + rescan", menu_state["buttons"]["clear"])
+    draw_button(frame, "clear", "Delete track", menu_state["buttons"]["clear"])
 
 
 def handle_card_menu_key(key):
@@ -423,7 +607,12 @@ def handle_card_menu_key(key):
         return run_menu_action("force")
 
     if key in (ord("m"), ord("M")):
+        if menu_state.get("selected_tracks"):
+            return bool(rescan_selected_tracks())
         return run_menu_action("selector")
+
+    if key in (ord("r"), ord("R")):
+        return run_menu_action("rescan")
 
     if key == 27:
         menu_state["active"] = False
@@ -450,12 +639,45 @@ def scan_unrecognized_spot(x, y):
         return False
 
     print(f"Manual click scan: {side} at ({x}, {y})")
-    point_submitter = runtime.get("point_submitter")
-    if point_submitter is not None:
-        point_submitter(frame, x, y, side)
-    else:
-        scan_point_for_card(frame, x, y, side, catalog)
+    # Manual click is intentionally synchronous so it can use best-of-N fresh
+    # frames and immediately print/open feedback. The async worker path only had
+    # the stale clicked frame, which made manual scans feel like no-ops.
+    scan_point_for_card(frame, x, y, side, catalog, frame_getter=frame_getter)
     return True
+
+
+
+
+def aggressive_scan_rect(x1, y1, x2, y2):
+    """Force a recognition pass inside a user-drawn rectangle.
+
+    This is used when the marquee does not fully contain any existing track:
+    the user is usually telling the app, "you missed something here."
+    Unlike passive scans, this bypasses stable-track suppression and tries all
+    detected candidates in the rectangle.
+    """
+    side = side_for_point((int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2)
+    if side is None:
+        print("Aggressive scan skipped: selection is outside both playmat ROIs.")
+        return 0
+
+    frame_getter = runtime.get("frame_getter")
+    frame = frame_getter() if frame_getter is not None else None
+    if frame is None:
+        print("Aggressive scan skipped: no camera frame available.")
+        return 0
+
+    print(f"Aggressive manual scan: {side} region ({int(x1)}, {int(y1)})-({int(x2)}, {int(y2)})")
+    return scan_region_for_cards_aggressive(
+        frame,
+        int(x1),
+        int(y1),
+        int(x2),
+        int(y2),
+        side,
+        runtime.get("catalog"),
+        frame_getter=frame_getter,
+    )
 
 
 def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point_submitter=None, box_submitter=None, status_controls_getter=None):
@@ -479,6 +701,15 @@ def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point
 
         if event == cv2.EVENT_MOUSEMOVE:
             update_hover(source_x, source_y)
+
+            if menu_state.get("selecting_tracks"):
+                menu_state["selection_current"] = (source_x, source_y)
+                start = menu_state.get("selection_start")
+                if start is not None:
+                    x, y, w, h = _normalize_rect_from_points(start, (source_x, source_y))
+                    if w >= MANUAL_DRAG_MIN_WIDTH_PX or h >= MANUAL_DRAG_MIN_HEIGHT_PX:
+                        update_selected_tracks_from_rect((x, y, w, h))
+                return
 
             if menu_state.get("pending_click_scan"):
                 start = menu_state.get("pending_click_start")
@@ -513,6 +744,13 @@ def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point
             if handle_manual_choice_click(source_x, source_y):
                 return
 
+            # ROI editing only gets mouse priority when explicitly enabled in Settings.
+            if roi_edit_enabled():
+                roi_on_mouse(event, source_x, source_y, flags, (frame_width, frame_height))
+                if drag_state.get("active"):
+                    menu_state["pending_click_scan"] = False
+                    return
+
             if menu_state["active"]:
                 update_hover(source_x, source_y)
                 hover = menu_state.get("hover")
@@ -521,27 +759,45 @@ def make_mouse_handler(frame_size_getter, frame_getter=None, catalog=None, point
                     return
                 menu_state["active"] = False
 
-            side, match = find_clicked_match(source_x, source_y)
-
-            if match is not None and LEFT_CLICK_FORCE_OBS:
-                force_match_to_front(side, match)
-                # Fast visual feedback.
-                match["queued"] = True
-                match["displayed"] = False
-                return
-
-            side = side_for_point(source_x, source_y)
-
-            if side is not None and MANUAL_DRAG_SCAN_ENABLED:
-                menu_state["pending_click_scan"] = True
-                menu_state["pending_click_start"] = (source_x, source_y)
-                menu_state["pending_click_side"] = side
-                return
-
-            roi_on_mouse(event, source_x, source_y, flags, (frame_width, frame_height))
+            # Single left-click keeps its original job: send the clicked tracked
+            # card to OBS according to the On Left-click setting. Dragging is the
+            # only way to select tracks for Delete / manual rescan.
+            menu_state["selecting_tracks"] = True
+            menu_state["selection_start"] = (source_x, source_y)
+            menu_state["selection_current"] = (source_x, source_y)
             return
 
         if event == cv2.EVENT_LBUTTONUP:
+            if menu_state.get("selecting_tracks"):
+                start = menu_state.get("selection_start")
+                current = menu_state.get("selection_current") or (source_x, source_y)
+                menu_state["selecting_tracks"] = False
+                menu_state["selection_start"] = None
+                menu_state["selection_current"] = None
+
+                if start is not None:
+                    x, y, w, h = _normalize_rect_from_points(start, current)
+                    if w < MANUAL_DRAG_MIN_WIDTH_PX and h < MANUAL_DRAG_MIN_HEIGHT_PX:
+                        # Click, not drag: do not select. Restore On Left-click
+                        # behavior by forcing the clicked track to OBS/front.
+                        side, match = find_clicked_match(source_x, source_y)
+                        if match is not None:
+                            send_match_from_left_click(side, match)
+                            menu_state["selected_tracks"] = set()
+                            return
+                        if MANUAL_POINT_SCAN_ON_CLICK:
+                            scan_unrecognized_spot(source_x, source_y)
+                        return
+
+                    selected = update_selected_tracks_from_rect((x, y, w, h))
+                    if selected:
+                        print(f"Selected {len(selected)} track(s). Press Delete to delete, or M to manually rescan.")
+                    else:
+                        menu_state["selected_tracks"] = set()
+                        count = aggressive_scan_rect(x, y, x + w, y + h)
+                        print(f"Aggressive scan region processed {count} candidate(s).")
+                return
+
             if menu_state.get("pending_click_scan"):
                 menu_state["pending_click_scan"] = False
                 start = menu_state.get("pending_click_start") or (source_x, source_y)

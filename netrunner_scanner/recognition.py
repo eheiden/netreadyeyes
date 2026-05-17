@@ -44,6 +44,7 @@ from .config import (
     VISUAL_RECHECK_USE_RAW_PROPOSAL,
     VISUAL_RECHECK_LOG_EVERY_CHECK,
     VISUAL_RECHECK_FORCE_PROCESS_THIS_SCAN,
+    VISUAL_RECHECK_FORCE_REQUEUE_SAME_LABEL,
     MANUAL_BOX_FIND_CANDIDATES_FIRST,
     MANUAL_BOX_PRESERVE_VISIBLE_MATCHES,
     MANUAL_BOX_MIN_CANDIDATE_AREA,
@@ -51,6 +52,7 @@ from .config import (
     MANUAL_DRAG_FORCE_FRONT,
     MANUAL_SCAN_RELAX_THRESHOLDS,
     MANUAL_SCAN_EXPAND_PX,
+    MANUAL_SCAN_MIN_AREA_FRACTION,
     MANUAL_CLICK_CARD_WIDTH_PX,
     MANUAL_CLICK_CARD_HEIGHT_PX,
     SAME_SPOT_SIGNATURE_CHECK_ENABLED,
@@ -105,17 +107,31 @@ from .config import (
     MANUAL_SCAN_BEST_OF_N_ENABLED,
     MANUAL_SCAN_BEST_OF_N_FRAMES,
     MANUAL_SCAN_BEST_OF_N_DELAY_SECONDS,
+    CARD_BACK_CONFIRMATION_ENABLED,
+    CARD_BACK_CONFIRMATIONS,
+    CARD_BACK_CONFIRM_WINDOW_SECONDS,
+    CARD_BACK_LAST_KNOWN_REACQUIRE_ENABLED,
+    AUTO_REJECT_WEAK_NEW_TRACKS,
+    AUTO_ACCEPT_NEW_CARD_MIN_SCORE,
+    AUTO_ACCEPT_NEW_CARD_MIN_MARGIN,
+    AUTO_ACCEPT_BAD_GEOMETRY_MIN_SCORE,
+    AUTO_ACCEPT_BAD_GEOMETRY_MIN_MARGIN,
+    AUTO_ACCEPT_WEAK_GEOMETRY_IF_SCORE_AT_LEAST,
+    AUTO_ACCEPT_WEAK_GEOMETRY_IF_MARGIN_AT_LEAST,
+    AUTO_BAD_GEOMETRY_REASONS,
 )
 from .crop import crop_candidate
+from .roi import dewarp_roi_for_scan, transform_match_for_display
 from .detection import find_card_candidates
 from .obs_bridge import send_match_to_obs
 from .obs_output import maybe_auto_queue
 from .tracking import CardTracker
 from .obs_queue import ObsFifoQueue
-from .corner_refine import dewarp_candidate_with_collectorvision
+from .corner_refine import dewarp_candidate_with_collectorvision, dewarp_manual_region_with_collectorvision
 from .perf import snapshot as perf_snapshot
 from .stability import log_event, log_human_event, recent_events
 from .diagnostics import save_candidate_diagnostics
+from .scan_diagnostics import log as diag_log, log_exception as diag_exception, log_throttled
 
 latest_matches = {"left": [], "right": []}
 
@@ -452,9 +468,7 @@ def recognize_manual_best_of_n(frame_getter, candidate, side, candidate_index, c
     return best
 
 
-def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog, force_diagnostics=False):
-    refined = get_candidate_pil_image(frame, candidate)
-
+def _recognize_from_refined(frame, candidate, side, candidate_index, catalog, refined, force_diagnostics=False, allow_card_back=True):
     if refined is None:
         return None
 
@@ -464,10 +478,10 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog, f
 
     card_back_box = refine_card_back_box(frame, candidate) if CARD_BACK_REFINE_BOX_ENABLED else None
 
-    if candidate.get("force_card_back"):
+    if allow_card_back and candidate.get("force_card_back"):
         return card_back_result(refined, detail, signature, card_back_box)
 
-    if looks_like_card_back(detail):
+    if allow_card_back and looks_like_card_back(detail):
         return card_back_result(refined, detail, signature, card_back_box)
 
     if DEBUG_SAVE_CROPS:
@@ -542,7 +556,7 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog, f
             min_margin = AMBIGUOUS_MATCH_MIN_MARGIN
 
         if best["score"] < AMBIGUOUS_MATCH_SCORE_THRESHOLD and margin < min_margin:
-            if looks_like_card_back(detail):
+            if allow_card_back and looks_like_card_back(detail):
                 best["id"] = "card_back"
                 best["score"] = 1.0
                 best["refine_reason"] = f"ambiguous_low_detail_card_back:{margin:.3f}"
@@ -565,6 +579,86 @@ def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog, f
     )
 
     return best
+
+
+def recognize_candidate_crop(frame, candidate, side, candidate_index, catalog, force_diagnostics=False):
+    refined = get_candidate_pil_image(frame, candidate)
+    return _recognize_from_refined(
+        frame=frame,
+        candidate=candidate,
+        side=side,
+        candidate_index=candidate_index,
+        catalog=catalog,
+        refined=refined,
+        force_diagnostics=force_diagnostics,
+        allow_card_back=True,
+    )
+
+
+def recognize_manual_region_direct(frame, x1, y1, x2, y2, side, candidate_index, catalog, source="manual_cv_direct"):
+    """Manual path: ask CollectorVision to find/dewarp the card inside the user's region first."""
+    try:
+        candidate, refined, reason = dewarp_manual_region_with_collectorvision(
+            frame, x1, y1, x2, y2, source=source
+        )
+    except Exception as exc:
+        diag_exception("manual_direct_collectorvision_exception", exc, side=side, region=[x1, y1, x2, y2])
+        return None, None, "collectorvision_exception"
+
+    if candidate is None or refined is None:
+        return None, None, reason
+
+    # Explicit manual scans should not turn a real card into card_back just
+    # because the crop is low-detail. Let the catalog result/alternatives speak.
+    best = _recognize_from_refined(
+        frame=frame,
+        candidate=candidate,
+        side=side,
+        candidate_index=candidate_index,
+        catalog=catalog,
+        refined=refined,
+        force_diagnostics=True,
+        allow_card_back=False,
+    )
+    if best is not None:
+        best["manual_candidate_source"] = source
+        best["manual_direct_reason"] = reason
+    return best, candidate, reason
+
+
+def recognize_manual_region_direct_best_of_n(frame_getter, frame, x1, y1, x2, y2, side, candidate_index, catalog, source="manual_cv_direct"):
+    frames = [frame]
+    if frame_getter is not None and MANUAL_SCAN_BEST_OF_N_ENABLED:
+        for _i in range(max(0, int(MANUAL_SCAN_BEST_OF_N_FRAMES) - 1)):
+            try:
+                fresh = frame_getter()
+            except Exception:
+                fresh = None
+            if fresh is not None:
+                frames.append(fresh)
+
+    best_overall = None
+    best_useful = None
+    best_candidate = None
+    last_reason = None
+
+    for offset, scan_frame in enumerate(frames):
+        best, candidate, reason = recognize_manual_region_direct(
+            scan_frame, x1, y1, x2, y2, side, candidate_index + offset, catalog, source=source
+        )
+        last_reason = reason
+        if best is None:
+            continue
+        score = float(best.get("score", 0.0))
+        if best_overall is None or score > float(best_overall.get("score", 0.0)):
+            best_overall = best
+            best_candidate = candidate
+        if _is_useful_manual_result(best):
+            if best_useful is None or score > float(best_useful.get("score", 0.0)):
+                best_useful = best
+                best_candidate = candidate
+
+    return (best_useful or best_overall), best_candidate, last_reason
 
 
 def candidate_visual_signature(frame, candidate):
@@ -796,7 +890,10 @@ def add_last_known_reacquire_candidates(frame, side, candidates):
     existing_rects = [cv2.boundingRect(c["box"]) for c in candidates if c.get("box") is not None]
     added = 0
 
-    # Prefer known/card_back tracks that have vanished from detection but are still recent.
+    # Prefer known tracks that have vanished from detection but are still recent.
+    # Do not synthesize card_back reacquire boxes by default: they become sticky
+    # artifacts when a card is picked up or when a smooth playmat patch is
+    # misread as a facedown card.
     tracks = sorted(
         tracker.tracks.get(side, []),
         key=lambda t: now_time - float(t.get("last_seen_at", 0.0)),
@@ -808,6 +905,9 @@ def add_last_known_reacquire_candidates(frame, side, candidates):
 
         label = track.get("label")
         if label in (None, "", "unknown", "tracking"):
+            continue
+
+        if label == "card_back" and not CARD_BACK_LAST_KNOWN_REACQUIRE_ENABLED:
             continue
 
         missing_seconds = now_time - float(track.get("last_seen_at", 0.0))
@@ -904,6 +1004,124 @@ def should_hold_stable_replacement(track, previous_label, best, forced_new):
     track["pending_replacement_count"] = 0
     return False
 
+
+
+def should_hold_weak_new_auto_result(track, best, previous_label):
+    """Return True for likely ghost reads from automatic scans.
+
+    This only protects brand-new / uncertain tracks. Existing stable card labels
+    are handled by the older replacement guards, while manual/direct scans use
+    their own more permissive path.
+    """
+    if not AUTO_REJECT_WEAK_NEW_TRACKS or best is None:
+        return False
+
+    if previous_label not in (None, "", "unknown", "tracking", "card_back"):
+        return False
+
+    new_id = best.get("id")
+    if new_id in (None, "", "unknown", "tracking", "card_back"):
+        return False
+
+    score = float(best.get("score", 0.0))
+    margin_value = best.get("margin")
+    try:
+        margin = float(margin_value) if margin_value is not None else 0.0
+    except (TypeError, ValueError):
+        margin = 0.0
+
+    reason = str(best.get("refine_reason") or "")
+    bad_geometry = any(token in reason for token in AUTO_BAD_GEOMETRY_REASONS)
+
+    # Real cards from the table camera often arrive with imperfect geometry
+    # flags (sharpness_low / aspect_bad / not_convex / area_ratio_low).  The
+    # previous ghost fix made those flags too authoritative, so normal cards
+    # had to be manually scanned.  A strong embedding margin is the best signal
+    # that this is a real card and not a mat/old-position ghost, so allow it.
+    if (
+        bad_geometry
+        and score >= AUTO_ACCEPT_WEAK_GEOMETRY_IF_SCORE_AT_LEAST
+        and margin >= AUTO_ACCEPT_WEAK_GEOMETRY_IF_MARGIN_AT_LEAST
+    ):
+        track["last_decision"] = f"accepted_weak_geometry score={score:.2f} margin={margin:.3f}"
+        return False
+
+    if score < AUTO_ACCEPT_NEW_CARD_MIN_SCORE:
+        return True
+
+    if margin < AUTO_ACCEPT_NEW_CARD_MIN_MARGIN and score < AUTO_ACCEPT_BAD_GEOMETRY_MIN_SCORE:
+        return True
+
+    if bad_geometry and (
+        score < AUTO_ACCEPT_BAD_GEOMETRY_MIN_SCORE
+        or margin < AUTO_ACCEPT_BAD_GEOMETRY_MIN_MARGIN
+    ):
+        return True
+
+    return False
+
+
+def _is_specific_card_id(card_id):
+    return card_id not in (None, "", "unknown", "tracking", "card_back")
+
+
+def _is_useful_manual_result(best):
+    if best is None:
+        return False
+    return _is_specific_card_id(best.get("id")) and float(best.get("score", 0.0)) >= MANUAL_CHOICE_MIN_SCORE
+
+
+def _manual_result_summary(prefix, side, best, source=None):
+    if best is None:
+        msg = f"{prefix}: {side} found no usable recognition result"
+    else:
+        msg = (
+            f"{prefix}: {side} result={best.get('id')} "
+            f"score={float(best.get('score', 0.0)):.2f} "
+            f"margin={best.get('margin')} reason={best.get('refine_reason')}"
+        )
+        if source:
+            msg += f" source={source}"
+    print(msg)
+    return msg
+
+
+def _best_manual_result_for_candidates(frame_getter, frame, candidates, side, base_index, catalog):
+    best_overall = None
+    best_useful = None
+    for offset, candidate in enumerate(candidates):
+        try:
+            result = recognize_manual_best_of_n(frame_getter, candidate, side, base_index + offset, catalog)
+            if result is None:
+                result = recognize_candidate_crop(frame, candidate, side, base_index + offset, catalog, force_diagnostics=True)
+        except Exception as exc:
+            diag_exception("manual_candidate_recognition_exception", exc, side=side, source=candidate.get("source"))
+            continue
+        if result is None:
+            continue
+        result["manual_candidate_source"] = candidate.get("source")
+        score = float(result.get("score", 0.0))
+        if best_overall is None or score > float(best_overall.get("score", 0.0)):
+            best_overall = result
+        if _is_useful_manual_result(result):
+            if best_useful is None or score > float(best_useful.get("score", 0.0)):
+                best_useful = result
+    return best_useful or best_overall
+
+
+def _protect_known_manual_label(track, best):
+    if track is None or best is None:
+        return False
+    previous = track.get("label")
+    new = best.get("id")
+    if not _is_specific_card_id(previous):
+        return False
+    if new in (None, "", "unknown", "card_back"):
+        track["last_decision"] = f"manual_scan_held_previous {previous} over {new}"
+        log_event(track.get("side"), track.get("track_id"), "manual_scan_held_previous", old=previous, rejected=new, score=f"{float(best.get('score', 0.0)):.2f}", reason=best.get("refine_reason"))
+        print(f"Manual scan kept existing label {previous}; rejected {new} ({best.get('refine_reason')}).")
+        return True
+    return False
 
 def should_offer_manual_choices(best):
     if not MANUAL_CHOICE_ENABLED or best is None:
@@ -1142,7 +1360,58 @@ def manual_selector_append_char(char, catalog):
 
 
 def scan_side_for_matches(frame, roi, side, catalog):
-    candidates = find_card_candidates(frame, roi)
+    source_frame = frame
+    source_roi = roi
+    diag_log(
+        "scan_side_enter",
+        side=side,
+        frame_shape=str(getattr(frame, "shape", None)),
+        roi=str(roi)[:300],
+        catalog_type=type(catalog).__name__,
+    )
+    scan_frame, scan_roi, display_matrix, roi_was_dewarped = dewarp_roi_for_scan(frame, roi)
+
+    if scan_roi is None:
+        latest_matches[side] = []
+        diag_log("scan_side_no_roi", side=side)
+        return
+
+    frame = scan_frame
+    try:
+        candidates = find_card_candidates(frame, scan_roi)
+    except Exception as exc:
+        diag_exception("find_candidates_exception", exc, side=side, scan_roi=scan_roi, frame_shape=str(getattr(frame, "shape", None)))
+        raise
+
+    diag_log(
+        "scan_side_candidates",
+        side=side,
+        scan_roi=scan_roi,
+        dewarped=bool(roi_was_dewarped),
+        candidate_count=len(candidates),
+        frame_shape=str(getattr(frame, "shape", None)),
+    )
+
+    # Safety net: if a perspective-corrected ROI produces no contour proposals,
+    # fall back to the original source-frame bounding rectangle for this pass.
+    # This keeps normal scanning alive even if an edited quad is too skewed, too
+    # small, or otherwise warps the image in a way that defeats contour finding.
+    if roi_was_dewarped and not candidates:
+        try:
+            from .roi import roi_to_rect, normalize_roi
+            fallback_roi = roi_to_rect(normalize_roi(source_roi, source_frame.shape[1], source_frame.shape[0]))
+            fallback_candidates = find_card_candidates(source_frame, fallback_roi)
+            if fallback_candidates:
+                frame = source_frame
+                scan_roi = fallback_roi
+                display_matrix = None
+                roi_was_dewarped = False
+                candidates = fallback_candidates
+                log_event(side, "side", "dewarp_fallback", candidates=len(candidates))
+                log_human_event(side, "side", "dewarp_fallback", candidates=len(candidates))
+        except Exception as exc:
+            log_event(side, "side", "dewarp_fallback_failed", error=str(exc))
+
     candidates = add_last_known_reacquire_candidates(frame, side, candidates)
 
     scan_items = []
@@ -1379,6 +1648,71 @@ def scan_side_for_matches(frame, roi, side, catalog):
             ):
                 weak_replacement_read = True
 
+        if should_hold_weak_new_auto_result(track, best, previous_label):
+            track["label"] = "unknown"
+            track["score"] = 0.0
+            track["margin"] = best.get("margin") if best is not None else None
+            track["rotation"] = "?"
+            track["used_fallback"] = True
+            track["refine_reason"] = f"held_weak_new_auto:{best.get('refine_reason')}"
+            track["last_decision"] = "held_weak_new_auto"
+            track["last_processed_at"] = tracker.current_time()
+            track["force_new_identification"] = False
+            held_unknown += 1
+            log_event(
+                side,
+                track.get("track_id"),
+                "held_weak_new_auto",
+                rejected=best.get("id"),
+                score=f"{float(best.get('score', 0.0)):.2f}",
+                margin=best.get("margin"),
+                reason=best.get("refine_reason"),
+            )
+            continue
+
+        # Card backs are deliberately conservative. Smooth playmat regions, hands,
+        # shadows, and recently removed cards can all look like low-detail backs.
+        # Require the same track to read as card_back for a couple of scans before
+        # we promote it to a visible card_back track. This greatly reduces gray
+        # card_back ghosts while still allowing actual facedown cards to appear.
+        if (
+            CARD_BACK_CONFIRMATION_ENABLED
+            and best is not None
+            and best.get("id") == "card_back"
+            and previous_label != "card_back"
+        ):
+            now_for_card_back = tracker.current_time()
+            started = float(track.get("pending_card_back_started_at", 0.0))
+            count = int(track.get("pending_card_back_count", 0))
+
+            if started <= 0.0 or now_for_card_back - started > CARD_BACK_CONFIRM_WINDOW_SECONDS:
+                started = now_for_card_back
+                count = 0
+
+            count += 1
+            track["pending_card_back_started_at"] = started
+            track["pending_card_back_count"] = count
+            track["last_processed_at"] = now_for_card_back
+            track["last_decision"] = f"pending_card_back {count}/{CARD_BACK_CONFIRMATIONS}"
+            track["refine_reason"] = f"pending_card_back:{count}/{CARD_BACK_CONFIRMATIONS}"
+
+            log_event(
+                side,
+                track.get("track_id"),
+                "pending_card_back",
+                count=count,
+                required=CARD_BACK_CONFIRMATIONS,
+                reason=best.get("refine_reason"),
+            )
+
+            if count < CARD_BACK_CONFIRMATIONS:
+                held_unknown += 1
+                continue
+
+        elif best is not None and best.get("id") != "card_back":
+            track["pending_card_back_count"] = 0
+            track["pending_card_back_started_at"] = 0.0
+
         if weak_replacement_read:
             streak = int(track.get("unknown_streak", 0)) + 1
             track["unknown_streak"] = streak
@@ -1483,7 +1817,19 @@ def scan_side_for_matches(frame, roi, side, catalog):
             label_changes=label_changes,
         )
 
-    latest_matches[side] = tracker.get_visible_matches(side)
+    visible_matches = tracker.get_visible_matches(side)
+    if roi_was_dewarped and display_matrix is not None:
+        latest_matches[side] = [transform_match_for_display(match, display_matrix) for match in visible_matches]
+    else:
+        latest_matches[side] = visible_matches
+
+    diag_log(
+        "scan_side_visible_matches",
+        side=side,
+        visible_count=len(visible_matches),
+        latest_count=len(latest_matches.get(side, [])),
+        labels=[str(m.get("label")) for m in latest_matches.get(side, [])[:8]],
+    )
 
     if OBS_QUEUE_ENABLED:
         obs_queue.tick()
@@ -1634,6 +1980,294 @@ def manual_candidate_from_rect(x1, y1, x2, y2):
     }
 
 
+
+def scan_region_for_cards_aggressive(frame, x1, y1, x2, y2, side, catalog, frame_getter=None):
+    """Force recognition for every candidate inside a user-drawn region.
+
+    Passive scanning intentionally skips stable/known tracks to reduce CPU and
+    prevent flicker. A user-drawn empty marquee means the opposite: the user is
+    pointing at something the detector missed or failed to track.
+
+    Manual drag first sends the user-selected region directly to CollectorVision.
+    If that fails, it falls back to OpenCV candidates plus the exact user rectangle.
+    """
+    before_matches = list(latest_matches.get(side, []))
+
+    left = max(0, int(min(x1, x2)) - MANUAL_SCAN_EXPAND_PX)
+    right = min(frame.shape[1] - 1, int(max(x1, x2)) + MANUAL_SCAN_EXPAND_PX)
+    top = max(0, int(min(y1, y2)) - MANUAL_SCAN_EXPAND_PX)
+    bottom = min(frame.shape[0] - 1, int(max(y1, y2)) + MANUAL_SCAN_EXPAND_PX)
+
+    if right <= left or bottom <= top or catalog is None:
+        return 0
+
+    # Manual drag = send the dragged area to CollectorVision directly first.
+    direct_best, direct_candidate, direct_reason = recognize_manual_region_direct_best_of_n(
+        frame_getter,
+        frame,
+        x1,
+        y1,
+        x2,
+        y2,
+        side,
+        880,
+        catalog,
+        source="aggressive_region_collectorvision_direct",
+    )
+
+    if direct_candidate is not None:
+        track, _needs_processing = tracker.update_or_create_track(
+            side=side,
+            box=direct_candidate["box"],
+        )
+        track["force_new_identification"] = True
+        track["displayed"] = False
+        track["queued"] = False
+        track["refined_box"] = direct_candidate["box"]
+        track["last_decision"] = f"aggressive_region_collectorvision_direct reason={direct_reason}"
+
+        previous_label = track.get("label")
+        _manual_result_summary(
+            "Aggressive region CollectorVision scan",
+            side,
+            direct_best,
+            direct_candidate.get("source"),
+        )
+
+        if not _protect_known_manual_label(track, direct_best):
+            tracker.apply_recognition_result(track, direct_best)
+
+        log_event(
+            side,
+            track.get("track_id"),
+            "aggressive_region_collectorvision_direct",
+            old=previous_label,
+            new=track.get("label"),
+            score=f"{float(track.get('score', 0.0)):.2f}",
+            reason=direct_reason,
+        )
+
+        latest_matches[side] = tracker.get_visible_matches(side)
+        return 1
+
+    print(f"Aggressive region CollectorVision direct scan found no card: {side} reason={direct_reason}")
+    log_event(side, "manual", "aggressive_region_collectorvision_no_card", reason=direct_reason)
+
+    roi = [left, top, right - left, bottom - top]
+
+    # Fallback: use the center of the dragged region.
+    # The previous broken version used x/y here, but region scans only have
+    # x1/y1/x2/y2. That caused NameError after CollectorVision failed.
+    region_cx = int((x1 + x2) * 0.5)
+    region_cy = int((y1 + y2) * 0.5)
+
+    click_half_w = (MANUAL_CLICK_CARD_WIDTH_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
+    click_half_h = (MANUAL_CLICK_CARD_HEIGHT_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
+
+    fallback_x1 = int(region_cx - click_half_w)
+    fallback_y1 = int(region_cy - click_half_h)
+    fallback_x2 = int(region_cx + click_half_w)
+    fallback_y2 = int(region_cy + click_half_h)
+
+    direct_best, direct_candidate, direct_reason = recognize_manual_region_direct_best_of_n(
+        frame_getter,
+        frame,
+        fallback_x1,
+        fallback_y1,
+        fallback_x2,
+        fallback_y2,
+        side,
+        720,
+        catalog,
+        source="manual_region_center_collectorvision_direct",
+    )
+
+    if direct_candidate is not None:
+        track, _needs_processing = tracker.update_or_create_track(
+            side=side,
+            box=direct_candidate["box"],
+        )
+        track["force_new_identification"] = True
+        track["displayed"] = False
+        track["queued"] = False
+        track["refined_box"] = direct_candidate["box"]
+        track["last_decision"] = f"manual_region_center_collectorvision_direct reason={direct_reason}"
+
+        previous_label = track.get("label")
+        _manual_result_summary(
+            "Manual region-center CollectorVision scan",
+            side,
+            direct_best,
+            direct_candidate.get("source"),
+        )
+
+        if should_offer_manual_choices(direct_best):
+            track["last_alternatives"] = direct_best.get("alternatives") or []
+            if not _protect_known_manual_label(track, direct_best):
+                tracker.apply_recognition_result(track, direct_best)
+            open_manual_choices(side, track, direct_best, title=MANUAL_CHOICE_TITLE)
+            refresh_latest_matches_preserving(side, before_matches)
+            return 1
+
+        if not _protect_known_manual_label(track, direct_best):
+            tracker.apply_recognition_result(track, direct_best)
+
+        current_label = track.get("label")
+        current_score = float(track.get("score", 0.0))
+
+        if (
+            current_label
+            and current_label not in ("unknown", "card_back")
+            and current_score >= CONFIDENCE_THRESHOLD
+            and not track.get("queued", False)
+        ):
+            if OBS_QUEUE_ENABLED:
+                if MANUAL_POINT_FORCE_FRONT:
+                    obs_queue.enqueue_front(
+                        side=side,
+                        card_id=current_label,
+                        score=current_score,
+                        track=track,
+                    )
+                else:
+                    obs_queue.enqueue_match(
+                        side=side,
+                        card_id=current_label,
+                        score=current_score,
+                        track=track,
+                    )
+            elif AUTO_SEND_TO_OBS:
+                send_match_to_obs(side, current_label)
+
+        refresh_latest_matches_preserving(side, before_matches)
+
+        log_event(
+            side,
+            track.get("track_id"),
+            "manual_region_center_collectorvision_direct",
+            old=previous_label,
+            new=current_label,
+            score=f"{current_score:.2f}",
+            reason=direct_reason,
+        )
+
+        return 1
+
+    print(
+        f"Manual region-center CollectorVision direct scan found no card: "
+        f"{side} reason={direct_reason}; falling back to detector proposals."
+    )
+    log_event(
+        side,
+        "manual",
+        "manual_region_center_collectorvision_no_card",
+        x=region_cx,
+        y=region_cy,
+        reason=direct_reason,
+    )
+
+    try:
+        candidates = find_card_candidates(frame, roi)
+    except Exception as exc:
+        diag_exception("aggressive_region_find_candidates_exception", exc, side=side, roi=roi)
+        candidates = []
+
+    user_left = int(min(x1, x2))
+    user_right = int(max(x1, x2))
+    user_top = int(min(y1, y2))
+    user_bottom = int(max(y1, y2))
+    user_area = max(1, (user_right - user_left) * (user_bottom - user_top))
+
+    filtered = []
+    for candidate in candidates:
+        box = candidate.get("box")
+        if box is None:
+            continue
+
+        bx, by, bw, bh = cv2.boundingRect(box)
+        if bw <= 0 or bh <= 0:
+            continue
+
+        cx = bx + bw / 2.0
+        cy = by + bh / 2.0
+        if not (user_left <= cx <= user_right and user_top <= cy <= user_bottom):
+            continue
+
+        # In manual/aggressive mode, tiny detections inside a card, often the
+        # text box, should not beat the user's explicit full-card rectangle.
+        area = float(candidate.get("area", bw * bh))
+        if area < user_area * float(MANUAL_SCAN_MIN_AREA_FRACTION):
+            candidate["source"] = "aggressive_region_small_candidate_ignored"
+            continue
+
+        candidate["source"] = "aggressive_region_candidate"
+        filtered.append(candidate)
+
+    # Always try the exact user-declared rectangle too.
+    manual_rect = manual_candidate_from_rect(x1, y1, x2, y2)
+    manual_rect["source"] = "aggressive_region_user_rect"
+    filtered.append(manual_rect)
+
+    filtered.sort(key=lambda c: float(c.get("area", 0.0)), reverse=True)
+
+    processed = 0
+    for index, candidate in enumerate(filtered, start=1):
+        track, _needs_processing = tracker.update_or_create_track(
+            side=side,
+            box=candidate["box"],
+        )
+        track["force_new_identification"] = True
+        track["displayed"] = False
+        track["queued"] = False
+        track["refined_box"] = None
+        track["last_decision"] = f"aggressive_region_scan source={candidate.get('source')}"
+
+        best = recognize_manual_best_of_n(frame_getter, candidate, side, 900 + index, catalog)
+        if best is None:
+            best = recognize_candidate_crop(
+                frame,
+                candidate,
+                side,
+                900 + index,
+                catalog,
+                force_diagnostics=True,
+            )
+
+        previous_label = track.get("label")
+
+        if not _protect_known_manual_label(track, best):
+            tracker.apply_recognition_result(track, best)
+
+        current_label = track.get("label")
+        current_score = float(track.get("score", 0.0))
+
+        _manual_result_summary(
+            "Aggressive region scan",
+            side,
+            best,
+            candidate.get("source"),
+        )
+
+        log_event(
+            side,
+            track.get("track_id"),
+            "aggressive_region_scan",
+            source=candidate.get("source"),
+            old=previous_label,
+            new=current_label,
+            score=f"{current_score:.2f}",
+        )
+
+        processed += 1
+
+    if MANUAL_BOX_PRESERVE_VISIBLE_MATCHES:
+        refresh_latest_matches_preserving(side, before_matches)
+    else:
+        latest_matches[side] = tracker.get_visible_matches(side)
+
+    return processed
+
+
 def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog, frame_getter=None):
     before_matches = list(latest_matches.get(side, []))
 
@@ -1645,10 +2279,55 @@ def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog, frame_getter=None):
         search_x2 = min(frame.shape[1] - 1, x2 + MANUAL_SCAN_EXPAND_PX)
         search_y2 = min(frame.shape[0] - 1, y2 + MANUAL_SCAN_EXPAND_PX)
 
-    candidate = None
+    direct_best, direct_candidate, direct_reason = recognize_manual_region_direct_best_of_n(
+        frame_getter, frame, x1, y1, x2, y2, side, 760, catalog, source="manual_box_collectorvision_direct"
+    )
+    if direct_candidate is not None:
+        track, _needs_processing = tracker.update_or_create_track(side=side, box=direct_candidate["box"])
+        track["force_new_identification"] = True
+        track["refined_box"] = direct_candidate["box"]
+        track["last_decision"] = f"manual_box_collectorvision_direct reason={direct_reason}"
+        previous_label = track.get("label")
+        _manual_result_summary("Manual box CollectorVision scan", side, direct_best, direct_candidate.get("source"))
+
+        if should_offer_manual_choices(direct_best):
+            track["last_alternatives"] = direct_best.get("alternatives") or []
+            if not _protect_known_manual_label(track, direct_best):
+                tracker.apply_recognition_result(track, direct_best)
+            open_manual_choices(side, track, direct_best, title=MANUAL_CHOICE_TITLE)
+            latest_matches[side] = tracker.get_visible_matches(side)
+            return track
+
+        if not _protect_known_manual_label(track, direct_best):
+            tracker.apply_recognition_result(track, direct_best)
+
+        current_label = track.get("label")
+        current_score = float(track.get("score", 0.0))
+        if current_label and current_label not in ("unknown", "card_back") and current_score >= CONFIDENCE_THRESHOLD and not track.get("queued", False):
+            if OBS_QUEUE_ENABLED:
+                if MANUAL_DRAG_FORCE_FRONT:
+                    obs_queue.enqueue_front(side=side, card_id=current_label, score=current_score, track=track)
+                else:
+                    obs_queue.enqueue_match(side=side, card_id=current_label, score=current_score, track=track)
+            elif AUTO_SEND_TO_OBS:
+                send_match_to_obs(side, current_label)
+
+        latest_matches[side] = tracker.get_visible_matches(side)
+        log_event(side, track.get("track_id"), "manual_box_collectorvision_direct", old=previous_label, new=current_label, score=f"{current_score:.2f}", reason=direct_reason)
+        return track
+
+    print(f"Manual box CollectorVision direct scan found no card: {side} reason={direct_reason}")
+
+    candidates_to_try = []
+
+    # First trust the rectangle the user/track gave us. If detection only sees a
+    # text box, this full-card rect is usually the better manual cue.
+    user_candidate = manual_candidate_from_rect(x1, y1, x2, y2)
+    user_candidate["source"] = "manual_box_user_rect"
+    candidates_to_try.append(user_candidate)
 
     if MANUAL_BOX_FIND_CANDIDATES_FIRST:
-        candidate = best_manual_candidate_in_box(
+        detector_candidate = best_manual_candidate_in_box(
             frame,
             search_x1,
             search_y1,
@@ -1656,22 +2335,30 @@ def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog, frame_getter=None):
             search_y2,
             side,
         )
+        if detector_candidate is not None:
+            candidates_to_try.append(detector_candidate)
 
-    if candidate is None:
-        candidate = manual_candidate_from_rect(search_x1, search_y1, search_x2, search_y2)
+    relaxed_candidate = manual_candidate_from_rect(search_x1, search_y1, search_x2, search_y2)
+    relaxed_candidate["source"] = "manual_box_relaxed_rect"
+    candidates_to_try.append(relaxed_candidate)
+
+    # Pick a specific-card result over card_back/unknown, even if the specific
+    # card's score is slightly lower. Manual mode means the user is telling us
+    # there is a real card here.
+    best = _best_manual_result_for_candidates(frame_getter, frame, candidates_to_try, side, 998, catalog)
+    candidate = candidates_to_try[0]
+    source = best.get("manual_candidate_source") if best is not None else candidate.get("source")
+    for c in candidates_to_try:
+        if c.get("source") == source:
+            candidate = c
+            break
 
     track, _needs_processing = tracker.update_or_create_track(side=side, box=candidate["box"])
     track["force_new_identification"] = True
     track["last_decision"] = f"manual_box_scan source={candidate.get('source')}"
-    best = recognize_manual_best_of_n(frame_getter, candidate, side, 998, catalog)
-    if best is None:
-        best = recognize_candidate_crop(frame, candidate, side, 998, catalog, force_diagnostics=True)
-
-    if best is None and MANUAL_SCAN_RELAX_THRESHOLDS:
-        candidate["source"] = "manual_drag_relaxed"
-        best = recognize_candidate_crop(frame, candidate, side, 999, catalog, force_diagnostics=True)
 
     previous_label = track.get("label")
+    _manual_result_summary("Manual box scan", side, best, candidate.get("source"))
 
     if should_offer_manual_choices(best):
         track["last_alternatives"] = best.get("alternatives") or []
@@ -1683,7 +2370,8 @@ def scan_box_for_card(frame, x1, y1, x2, y2, side, catalog, frame_getter=None):
             latest_matches[side] = tracker.get_visible_matches(side)
         return track
 
-    tracker.apply_recognition_result(track, best)
+    if not _protect_known_manual_label(track, best):
+        tracker.apply_recognition_result(track, best)
 
     current_label = track.get("label")
     current_score = float(track.get("score", 0.0))
@@ -1736,41 +2424,85 @@ def scan_point_for_card(frame, x, y, side, catalog, frame_getter=None):
     before_matches = list(latest_matches.get(side, []))
     roi = rois.get(side)
 
-    if roi is None:
+    if roi is None or catalog is None:
+        print(f"Manual point scan: {side} skipped; no ROI/catalog.")
         return None
 
-    candidates = find_card_candidates(frame, roi)
+    try:
+        candidates = find_card_candidates(frame, roi)
+    except Exception as exc:
+        diag_exception("manual_point_find_candidates_exception", exc, side=side, x=x, y=y, roi=roi)
+        candidates = []
+
+    half_w = (MANUAL_CLICK_CARD_WIDTH_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
+    half_h = (MANUAL_CLICK_CARD_HEIGHT_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
 
     containing = []
+    local = []
     for candidate in candidates:
         box = candidate.get("box")
-        if box is not None and _cv2.pointPolygonTest(box, (float(x), float(y)), False) >= 0:
+        if box is None:
+            continue
+        if _cv2.pointPolygonTest(box, (float(x), float(y)), False) >= 0:
+            candidate["source"] = "manual_point_containing_candidate"
             containing.append(candidate)
+            continue
+        bx, by, bw, bh = _cv2.boundingRect(box)
+        cx = bx + bw / 2.0
+        cy = by + bh / 2.0
+        if abs(cx - x) <= half_w and abs(cy - y) <= half_h:
+            candidate["source"] = "manual_point_nearby_candidate"
+            local.append(candidate)
 
-    if containing:
-        containing.sort(key=lambda c: c.get("area", 0.0), reverse=True)
-        candidate = containing[0]
-    else:
-        # User clicked a missed card. Search a larger manual box around that point
-        # before falling back to a plain centered crop.
-        half_w = (MANUAL_CLICK_CARD_WIDTH_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
-        half_h = (MANUAL_CLICK_CARD_HEIGHT_PX // 2) + MANUAL_POINT_EXPAND_SEARCH_PX
-        candidate = best_manual_candidate_in_box(
-            frame,
-            x - half_w,
-            y - half_h,
-            x + half_w,
-            y + half_h,
-            side,
-        )
-        if candidate is None:
-            candidate = manual_candidate_at_point(x, y)
+    containing.sort(key=lambda c: float(c.get("area", 0.0)), reverse=True)
+    local.sort(key=lambda c: float(c.get("area", 0.0)), reverse=True)
 
-    # Recognize first. If this explicit click still produces no useful answer,
-    # preserve the existing overlays and do not create a temporary unknown box.
-    best = recognize_manual_best_of_n(frame_getter, candidate, side, 999, catalog)
-    if best is None:
-        best = recognize_candidate_crop(frame, candidate, side, 999, catalog, force_diagnostics=True)
+    candidates_to_try = []
+    candidates_to_try.extend(containing[:4])
+
+    # Also search the local click area, but do not let small inner-card boxes be
+    # the only thing tried. These were the source of the "text box only" tracks.
+    detector_candidate = best_manual_candidate_in_box(
+        frame,
+        x - half_w,
+        y - half_h,
+        x + half_w,
+        y + half_h,
+        side,
+    )
+    if detector_candidate is not None:
+        candidates_to_try.append(detector_candidate)
+
+    candidates_to_try.extend(local[:3])
+
+    # Explicit click fallback rectangles. These are deliberately tried because
+    # manual mode means "there is a card under my cursor; try harder."
+    candidates_to_try.append(manual_candidate_at_point(x, y))
+    candidates_to_try.append(manual_candidate_at_point(x, y, MANUAL_CLICK_CARD_WIDTH_PX + 70, MANUAL_CLICK_CARD_HEIGHT_PX + 95))
+    candidates_to_try.append(manual_candidate_at_point(x, y, MANUAL_CLICK_CARD_HEIGHT_PX, MANUAL_CLICK_CARD_WIDTH_PX))
+
+    # Deduplicate candidates by bounding rectangle.
+    deduped = []
+    seen_rects = set()
+    for candidate in candidates_to_try:
+        box = candidate.get("box")
+        if box is None:
+            continue
+        rect = tuple(int(v) for v in _cv2.boundingRect(box))
+        if rect in seen_rects:
+            continue
+        seen_rects.add(rect)
+        deduped.append(candidate)
+
+    best = _best_manual_result_for_candidates(frame_getter, frame, deduped, side, 999, catalog)
+    source = best.get("manual_candidate_source") if best is not None else None
+    candidate = deduped[0] if deduped else manual_candidate_at_point(x, y)
+    for c in deduped:
+        if c.get("source") == source:
+            candidate = c
+            break
+
+    _manual_result_summary("Manual point scan", side, best, candidate.get("source"))
 
     if best is None:
         refresh_latest_matches_preserving(side, before_matches)
@@ -1780,7 +2512,11 @@ def scan_point_for_card(frame, x, y, side, catalog, frame_getter=None):
     best_id = best.get("id")
     best_score = float(best.get("score", 0.0))
 
-    if not MANUAL_POINT_CREATE_UNKNOWN_TRACK and best_id in ("unknown", None, ""):
+    # For ambiguous/low-confidence manual clicks, create/update a temporary track
+    # so the manual choice UI can appear. Previously this returned silently and
+    # felt like the click did nothing.
+    create_track_for_feedback = should_offer_manual_choices(best) or MANUAL_POINT_CREATE_UNKNOWN_TRACK or _is_specific_card_id(best_id)
+    if not create_track_for_feedback:
         refresh_latest_matches_preserving(side, before_matches)
         log_event(
             side,
@@ -1793,15 +2529,18 @@ def scan_point_for_card(frame, x, y, side, catalog, frame_getter=None):
             reason=best.get("refine_reason"),
             source=candidate.get("source"),
         )
+        print(f"Manual point scan: no useful card ID; best={best_id} score={best_score:.2f} reason={best.get('refine_reason')}")
         return None
 
     if (
         candidate.get("source") == "manual_click"
         and best_id == "card_back"
         and not MANUAL_SCAN_ALLOW_CARDBACK
+        and not should_offer_manual_choices(best)
     ):
         refresh_latest_matches_preserving(side, before_matches)
         log_event(side, "manual", "manual_point_rejected_cardback", x=x, y=y, source=candidate.get("source"))
+        print("Manual point scan: rejected card_back result for explicit click.")
         return None
 
     track, _needs_processing = tracker.update_or_create_track(side=side, box=candidate["box"])
@@ -1812,10 +2551,53 @@ def scan_point_for_card(frame, x, y, side, catalog, frame_getter=None):
 
     if should_offer_manual_choices(best):
         track["last_alternatives"] = best.get("alternatives") or []
-        tracker.apply_recognition_result(track, best)
+        if not _protect_known_manual_label(track, best):
+            tracker.apply_recognition_result(track, best)
         open_manual_choices(side, track, best, title=MANUAL_CHOICE_TITLE)
         refresh_latest_matches_preserving(side, before_matches)
         return track
+
+    if not _protect_known_manual_label(track, best):
+        tracker.apply_recognition_result(track, best)
+
+    current_label = track.get("label")
+    current_score = float(track.get("score", 0.0))
+
+    if (
+        current_label
+        and current_label not in ("unknown", "card_back")
+        and current_score >= CONFIDENCE_THRESHOLD
+        and not track.get("queued", False)
+    ):
+        if OBS_QUEUE_ENABLED:
+            if MANUAL_POINT_FORCE_FRONT:
+                obs_queue.enqueue_front(
+                    side=side,
+                    card_id=current_label,
+                    score=current_score,
+                    track=track,
+                )
+            else:
+                obs_queue.enqueue_match(
+                    side=side,
+                    card_id=current_label,
+                    score=current_score,
+                    track=track,
+                )
+        elif AUTO_SEND_TO_OBS:
+            send_match_to_obs(side, current_label)
+
+    refresh_latest_matches_preserving(side, before_matches)
+    log_event(
+        side,
+        track.get("track_id"),
+        "manual_point_scan",
+        source=candidate.get("source"),
+        old=previous_label,
+        new=current_label,
+        score=f"{current_score:.2f}",
+    )
+    return track
 
     tracker.apply_recognition_result(track, best)
 

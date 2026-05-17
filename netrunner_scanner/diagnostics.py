@@ -79,10 +79,16 @@ def save_candidate_diagnostics(
         cv2.polylines(overlay, [box.astype(np.intp)], True, (0, 255, 255), 2)
 
     refined_box = None
-    if refined:
-        refined_box = refined.get("refined_box") or refined.get("proposal_box")
+    if isinstance(refined, dict):
+        # Do not use `a or b` here: CollectorVision boxes may be numpy arrays,
+        # whose truth value is ambiguous and raises ValueError.
+        refined_box = refined.get("refined_box")
+        if refined_box is None:
+            refined_box = refined.get("proposal_box")
         if refined_box is not None:
-            cv2.polylines(overlay, [refined_box.astype(np.intp)], True, (255, 255, 255), 2)
+            refined_box = np.asarray(refined_box)
+            if refined_box.size:
+                cv2.polylines(overlay, [refined_box.astype(np.intp)], True, (255, 255, 255), 2)
 
     cv2.imwrite(str(overlay_path), overlay)
 
@@ -96,7 +102,7 @@ def save_candidate_diagnostics(
 
     cv2.imwrite(str(raw_path), frame)
 
-    if refined and refined.get("image") is not None:
+    if isinstance(refined, dict) and refined.get("image") is not None:
         refined["image"].save(refined_path)
 
     top = []

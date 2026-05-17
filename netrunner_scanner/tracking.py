@@ -15,6 +15,10 @@ from .config import (
     MOVED_REIDENTIFY_ENABLED,
     MOVED_REIDENTIFY_MIN_PX,
     MOVED_REIDENTIFY_COOLDOWN_SECONDS,
+    CARD_BACK_VISIBLE_MISSING_SECONDS,
+    CARD_BACK_EXPIRE_SECONDS,
+    HIDE_UNCONFIRMED_UNKNOWN_TRACKS,
+    HIDE_CARD_BACK_TRACKS,
 )
 from .stability import log_event, log_human_event
 
@@ -91,10 +95,14 @@ class CardTracker:
         if now is None:
             now = time.time()
 
-        self.tracks[side] = [
-            track for track in self.tracks[side]
-            if now - track["last_seen_at"] <= self.expire_seconds
-        ]
+        kept = []
+        for track in self.tracks[side]:
+            label = track.get("label")
+            max_age = CARD_BACK_EXPIRE_SECONDS if label == "card_back" else self.expire_seconds
+            if now - track["last_seen_at"] <= max_age:
+                kept.append(track)
+
+        self.tracks[side] = kept
 
     def match_track(self, side, box):
         rect = box_to_rect(box)
@@ -197,6 +205,8 @@ class CardTracker:
                 "pending_replacement_started_at": 0.0,
                 "last_alternatives": [],
                 "forced_visual_change_at": 0.0,
+                "pending_card_back_count": 0,
+                "pending_card_back_started_at": 0.0,
             }
             self.next_track_id += 1
             self.tracks[side].append(track)
@@ -366,7 +376,26 @@ class CardTracker:
         matches = []
 
         for track in self.tracks[side]:
-            if now - track["last_seen_at"] > TRACK_VISIBLE_MISSING_SECONDS:
+            label = track.get("label")
+
+            # Do not draw uncertain bookkeeping tracks. These are useful internally
+            # for retry/cooldown logic, but displaying them creates stale-looking
+            # boxes after a card has been picked up or moved.
+            if HIDE_UNCONFIRMED_UNKNOWN_TRACKS and label in (None, "", "unknown", "tracking"):
+                continue
+
+            # Card-back reads are intentionally conservative because smooth
+            # playmat/table patches are easy false positives. Keep them out of
+            # the overlay unless explicitly re-enabled in config.py.
+            if HIDE_CARD_BACK_TRACKS and label == "card_back":
+                continue
+
+            visible_missing_seconds = (
+                CARD_BACK_VISIBLE_MISSING_SECONDS
+                if label == "card_back"
+                else TRACK_VISIBLE_MISSING_SECONDS
+            )
+            if now - track["last_seen_at"] > visible_missing_seconds:
                 continue
 
             active_box = track.get("refined_box") if (

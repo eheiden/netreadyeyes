@@ -203,3 +203,77 @@ def dewarp_candidate_with_collectorvision(frame, candidate):
         "fallback_to_opencv": False,
         "reason": "refined",
     }
+
+
+
+def dewarp_manual_region_with_collectorvision(frame, x1, y1, x2, y2, source="manual_region"):
+    """Run CollectorVision directly on a user-declared region.
+
+    This is intentionally different from dewarp_candidate_with_collectorvision():
+    manual mode means the user is telling us "there is a card in this area".
+    We therefore avoid validating the result against an OpenCV proposal box,
+    because that proposal may be a text box or other inner-card false positive.
+    """
+    frame_h, frame_w = frame.shape[:2]
+    left = int(clamp(min(x1, x2), 0, frame_w - 1))
+    right = int(clamp(max(x1, x2), left + 1, frame_w))
+    top = int(clamp(min(y1, y2), 0, frame_h - 1))
+    bottom = int(clamp(max(y1, y2), top + 1, frame_h))
+
+    crop = frame[top:bottom, left:right]
+    if crop is None or crop.size == 0:
+        return None, None, "empty_manual_region"
+
+    detector = get_corner_detector()
+    detection = detector.detect(crop)
+
+    sharpness = float(detection.sharpness or 0.0)
+    confidence = float(detection.confidence)
+
+    if not detection.card_present:
+        return None, None, f"collectorvision_no_card_present conf={confidence:.3f} sharp={sharpness:.3f}"
+
+    refined_box = detection_corners_to_frame_box(
+        detection=detection,
+        crop_origin=(left, top),
+        crop_shape=crop.shape,
+    )
+
+    if refined_box is None or len(refined_box) != 4:
+        return None, None, "collectorvision_no_corners"
+
+    # Keep only very basic sanity checks here. Manual scan must not be rejected
+    # because it does not match an OpenCV proposal; there may not be one.
+    if polygon_area(refined_box) <= 0:
+        return None, None, "collectorvision_bad_area"
+
+    if min_edge_length(refined_box) < max(12.0, CORNER_REFINER_MIN_EDGE_LENGTH * 0.45):
+        return None, None, f"collectorvision_edge_short:{min_edge_length(refined_box):.1f}"
+
+    aspect = refined_aspect_ratio(refined_box)
+    if not (0.95 <= aspect <= 2.25):
+        return None, None, f"collectorvision_aspect_bad:{aspect:.2f}"
+
+    try:
+        dewarped = detection.dewarp(crop)
+    except Exception as e:
+        return None, None, f"collectorvision_dewarp_failed:{e}"
+
+    candidate = {
+        "box": refined_box.astype(np.intp),
+        "area": float(polygon_area(refined_box)),
+        "source": source,
+        "manual_cv_region": [left, top, right, bottom],
+    }
+
+    refined = {
+        "image": dewarped,
+        "refined_box": refined_box.astype(np.intp),
+        "proposal_box": refined_box.astype(np.intp),
+        "sharpness": sharpness,
+        "confidence": confidence,
+        "fallback_to_opencv": False,
+        "reason": "manual_collectorvision_direct",
+    }
+
+    return candidate, refined, "ok"

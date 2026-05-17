@@ -3,6 +3,8 @@ import time
 import cv2
 import numpy as np
 
+from .roi import dewarp_roi_for_scan
+
 from .config import (
     MOTION_DOWNSAMPLE_WIDTH,
     MOTION_SCAN_THRESHOLD,
@@ -22,9 +24,16 @@ class MotionGate:
         }
 
     def _prepare_roi(self, frame, roi):
-        x, y, w, h = roi
-        crop = frame[y:y + h, x:x + w]
+        scan_frame, scan_roi, _matrix, _dewarped = dewarp_roi_for_scan(frame, roi)
 
+        if scan_roi is None or scan_frame is None or scan_frame.size == 0:
+            return None
+
+        x, y, w, h = [int(v) for v in scan_roi]
+        if w <= 0 or h <= 0:
+            return None
+
+        crop = scan_frame[y:y + h, x:x + w]
         if crop.size == 0:
             return None
 

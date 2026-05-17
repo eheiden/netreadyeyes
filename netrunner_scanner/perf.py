@@ -1,5 +1,6 @@
 
 import os
+from pathlib import Path
 import threading
 import time
 from collections import deque
@@ -89,7 +90,9 @@ def _write_spike_log(process_cpu, rows):
     _last_spike_logged_at = t
 
     try:
-        with open(PERF_SPIKE_LOG_FILE, "a", encoding="utf-8") as f:
+        path = Path(PERF_SPIKE_LOG_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             f.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} process_cpu={process_cpu:.1f}%\n")
             for row in rows:
                 f.write(

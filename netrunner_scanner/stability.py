@@ -47,7 +47,9 @@ def log_event(side, track_id, event, **fields):
         del _recent_events[: len(_recent_events) - STABILITY_EVENT_LOG_MAX_LINES]
 
     try:
-        with Path(STABILITY_EVENT_LOG_FILE).open("a", encoding="utf-8") as f:
+        path = Path(STABILITY_EVENT_LOG_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
         pass

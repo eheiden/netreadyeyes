@@ -414,11 +414,9 @@ def make_status_sidebar(height, status):
     y += 30
 
     global last_controls
-
-    if STATUS_PANEL_SHOW_CONTROLS:
-        y, last_controls = draw_controls(panel, y)
-    else:
-        last_controls = {}
+    # Runtime controls moved to the real Tk menu/ribbon.  Keep the drawn
+    # sidebar focused on stream-facing information only.
+    last_controls = {}
 
     if STATUS_PANEL_SHOW_LEGEND and not STATUS_PANEL_COMPACT_MODE:
         y = draw_legend(panel, y)

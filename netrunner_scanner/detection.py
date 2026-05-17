@@ -574,8 +574,15 @@ def solid_back_candidates(frame, roi, gray_roi):
     if not SOLID_BACK_PROPOSALS_ENABLED:
         return []
 
-    x, y, w, h = roi
+    rect = _roi_to_int_rect(roi, frame)
+    if rect is None:
+        return []
+
+    x, y, w, h = rect
     roi_img = frame[y:y + h, x:x + w]
+    if roi_img is None or roi_img.size == 0:
+        return []
+
     roi_area = w * h
 
     lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
@@ -654,9 +661,53 @@ def solid_back_candidates(frame, roi, gray_roi):
     return candidates
 
 
+def _roi_to_int_rect(roi, frame):
+    """Return a clamped integer [x, y, w, h] ROI for numpy slicing.
+
+    Most scan paths pass a simple rectangle, but the newer ROI editor stores
+    playmat ROIs as quad dictionaries. Point/manual scan can also produce float
+    coordinates. OpenCV/numpy slices require real ints, so normalize here at the
+    detection boundary instead of relying on every caller to remember.
+    """
+    if roi is None or frame is None or not hasattr(frame, "shape"):
+        return None
+
+    try:
+        if isinstance(roi, dict) and "points" in roi:
+            pts = np.asarray(roi.get("points"), dtype=np.float32).reshape(-1, 2)
+            x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+        else:
+            x, y, w, h = roi
+
+        x = int(round(float(x)))
+        y = int(round(float(y)))
+        w = int(round(float(w)))
+        h = int(round(float(h)))
+    except Exception:
+        return None
+
+    frame_h, frame_w = frame.shape[:2]
+    x1 = max(0, min(frame_w - 1, x))
+    y1 = max(0, min(frame_h - 1, y))
+    x2 = max(0, min(frame_w, x + max(0, w)))
+    y2 = max(0, min(frame_h, y + max(0, h)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+
+
 def find_card_candidates(frame, roi):
-    x, y, w, h = roi
+    rect = _roi_to_int_rect(roi, frame)
+    if rect is None:
+        return []
+
+    x, y, w, h = rect
     roi_img = frame[y:y + h, x:x + w]
+    if roi_img is None or roi_img.size == 0:
+        return []
+
     roi_area = w * h
 
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
@@ -688,7 +739,9 @@ def find_card_candidates(frame, roi):
         if candidate is not None:
             candidates.append(candidate)
 
-    candidates.extend(solid_back_candidates(frame, roi, gray))
+    # Pass the already-normalized rect so solid-back proposals cannot receive
+    # float/manual-click ROIs and crash on numpy slicing.
+    candidates.extend(solid_back_candidates(frame, rect, gray))
 
     candidates = suppress_nested_and_composite_candidates(candidates)
     candidates = suppress_inner_overlap_boxes(candidates)
